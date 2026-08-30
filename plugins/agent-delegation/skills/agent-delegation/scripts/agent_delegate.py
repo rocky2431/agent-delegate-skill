@@ -20,8 +20,10 @@ from typing import Any, Iterator
 import uuid
 
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 SCHEMA_VERSION = 1
+DEFAULT_TIMEOUT_SECONDS = 7200
+MAX_TIMEOUT_SECONDS = 7200
 TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESERVED_TARGETS = {
     "cancel",
@@ -188,7 +190,9 @@ def _parse_chain(raw: str | None, caller: str) -> list[str]:
     return chain
 
 
-def _read_task(args: argparse.Namespace, cwd: Path, max_chars: int) -> tuple[str, str]:
+def _read_task(
+    args: argparse.Namespace, cwd: Path, max_chars: int | None
+) -> tuple[str, str]:
     if args.task is not None:
         task = args.task
         source = "argument"
@@ -209,7 +213,7 @@ def _read_task(args: argparse.Namespace, cwd: Path, max_chars: int) -> tuple[str
         raise DelegationError("Provide --task, --task-file, or piped stdin.")
     if not task.strip():
         raise DelegationError("Task must not be empty.")
-    if len(task) > max_chars:
+    if max_chars is not None and len(task) > max_chars:
         raise DelegationError(f"Task has {len(task)} characters; configured limit is {max_chars}.")
     return task, source
 
@@ -269,7 +273,7 @@ def _session_update(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_result(
-    events: str, max_chars: int
+    events: str, max_chars: int | None
 ) -> tuple[str, str | None, list[str], int, bool]:
     chunks: list[str] = []
     stop_reason: str | None = None
@@ -301,9 +305,24 @@ def _extract_result(
             if isinstance(message, str):
                 errors.append(message)
     full_text = "".join(chunks)
+    if max_chars is None:
+        return full_text, stop_reason, errors, parsed, False
     truncated = len(full_text) > max_chars
     assistant_text = full_text[:max_chars]
     return assistant_text, stop_reason, errors, parsed, truncated
+
+
+def _configured_char_limit(registry: dict[str, Any], key: str) -> int | None:
+    raw = registry.get(key)
+    if raw is None:
+        return None
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise DelegationError(f"Registry {key} must be a positive integer when configured.") from exc
+    if limit < 1:
+        raise DelegationError(f"Registry {key} must be a positive integer when configured.")
+    return limit
 
 
 def _normalized_exit_code(code: int) -> int:
@@ -346,22 +365,16 @@ def _run(args: argparse.Namespace) -> int:
     if not cwd.is_dir():
         raise DelegationError(f"Delegation cwd is not an existing directory: {cwd}")
 
-    configured_timeout = int(registry.get("default_timeout_seconds", 900))
+    configured_timeout = int(
+        registry.get("default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    )
     timeout = args.timeout if args.timeout is not None else configured_timeout
-    max_timeout = int(registry.get("max_timeout_seconds", 7200))
+    max_timeout = int(registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS))
     if timeout < 1 or timeout > max_timeout:
         raise DelegationError(f"timeout must be between 1 and {max_timeout} seconds.")
 
     permissions = args.permissions
-    if (permissions == "approve-all" or args.terminal) and not (
-        args.authorization_note and args.authorization_note.strip()
-    ):
-        raise DelegationError(
-            "Full-capability delegation requires a concrete --authorization-note that records "
-            "the existing owner authority and task boundary."
-        )
-
-    max_task_chars = int(registry.get("max_task_chars", 200000))
+    max_task_chars = _configured_char_limit(registry, "max_task_chars")
     task, task_source = _read_task(args, cwd, max_task_chars)
     delegation_id = uuid.uuid4().hex
     prompt = _delegation_context(
@@ -471,7 +484,7 @@ def _run(args: argparse.Namespace) -> int:
 
     _atomic_write_text(receipt_dir / "events.ndjson", stdout)
     _atomic_write_text(receipt_dir / "stderr.log", stderr)
-    max_result_chars = int(registry.get("max_result_chars", 20000))
+    max_result_chars = _configured_char_limit(registry, "max_result_chars")
     assistant_text, stop_reason, errors, parsed_events, text_truncated = _extract_result(
         stdout, max_result_chars
     )
@@ -710,7 +723,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--authorization-note",
-        help="Existing owner authority and prompt boundary recorded for full-capability transport.",
+        help="Optional existing owner authority or prompt-boundary note stored in the receipt.",
     )
     run_parser.add_argument("--dry-run", action="store_true", help="Validate and print the launch plan only.")
     run_parser.set_defaults(terminal=True, handler=_run)

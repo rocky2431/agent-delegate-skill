@@ -34,6 +34,22 @@ class InstallerTests(unittest.TestCase):
     def test_none_installs_runtime_without_a_skill_copy(self) -> None:
         self.assertEqual(install_user._parse_hosts("none"), [])
 
+    def test_legacy_generated_character_limits_are_removed(self) -> None:
+        registry = {"max_task_chars": 200000, "max_result_chars": 20000}
+
+        install_user._remove_legacy_default_char_limits(registry)
+
+        self.assertNotIn("max_task_chars", registry)
+        self.assertNotIn("max_result_chars", registry)
+
+    def test_explicit_character_limits_are_preserved(self) -> None:
+        registry = {"max_task_chars": 1234, "max_result_chars": 5678}
+
+        install_user._remove_legacy_default_char_limits(registry)
+
+        self.assertEqual(registry["max_task_chars"], 1234)
+        self.assertEqual(registry["max_result_chars"], 5678)
+
     def test_registry_merge_preserves_custom_target_and_other_acpx_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -72,7 +88,10 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(acpx["auth"], {"kept": "redacted"})
             self.assertEqual(acpx["agents"]["custom"], {"argv": custom["argv"]})
             self.assertEqual(acpx["agents"]["hermes"], {"argv": managed["hermes"]["argv"]})
-            self.assertEqual(acpx["defaultPermissions"], "approve-reads")
+            self.assertEqual(registry["default_timeout_seconds"], 7200)
+            self.assertEqual(registry["max_timeout_seconds"], 7200)
+            self.assertEqual(acpx["defaultPermissions"], "approve-all")
+            self.assertEqual(acpx["timeout"], 7200)
 
 
 if __name__ == "__main__":

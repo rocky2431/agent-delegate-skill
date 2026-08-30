@@ -66,8 +66,6 @@ class AgentDelegateCliTests(unittest.TestCase):
                     "default_timeout_seconds": 10,
                     "max_timeout_seconds": 30,
                     "max_delegation_depth": 4,
-                    "max_task_chars": 1000,
-                    "max_result_chars": 1000,
                     "targets": targets,
                 }
             ),
@@ -112,8 +110,6 @@ class AgentDelegateCliTests(unittest.TestCase):
             str(self.cwd),
             "--task",
             "summarize the input",
-            "--authorization-note",
-            "Owner authorized this fixture mission within its prompt boundary.",
             "--dry-run",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -185,7 +181,7 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("already appears", result.stderr)
 
-    def test_full_capability_default_requires_authorization_note(self) -> None:
+    def test_full_capability_default_does_not_require_authorization_note(self) -> None:
         result = self.run_cli(
             "run",
             "--to",
@@ -198,8 +194,68 @@ class AgentDelegateCliTests(unittest.TestCase):
             "change something",
             "--dry-run",
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["permissions"], "approve-all")
+        self.assertTrue(payload["terminal"])
+
+    def test_missing_timeout_config_defaults_to_two_hours(self) -> None:
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry.pop("default_timeout_seconds")
+        registry.pop("max_timeout_seconds")
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        result = self.run_cli(
+            "run",
+            "--to",
+            "beta",
+            "--caller",
+            "alpha",
+            "--cwd",
+            str(self.cwd),
+            "--task",
+            "use default timeout",
+            "--dry-run",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["timeout_seconds"], 7200)
+        self.assertIn("7200", payload["command"])
+
+    def test_missing_task_limit_accepts_more_than_legacy_default(self) -> None:
+        task_file = self.cwd / "large-task.txt"
+        task_file.write_text("x" * 200001, encoding="utf-8")
+        result = self.run_cli(
+            "run",
+            "--to",
+            "beta",
+            "--caller",
+            "alpha",
+            "--cwd",
+            str(self.cwd),
+            "--task-file",
+            str(task_file),
+            "--dry-run",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_explicit_task_limit_is_enforced(self) -> None:
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["max_task_chars"] = 3
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        result = self.run_cli(
+            "run",
+            "--to",
+            "beta",
+            "--caller",
+            "alpha",
+            "--cwd",
+            str(self.cwd),
+            "--task",
+            "four",
+            "--dry-run",
+        )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("authorization-note", result.stderr)
+        self.assertIn("configured limit is 3", result.stderr)
 
     def test_real_run_writes_private_receipt_and_normalizes_result(self) -> None:
         result = self.run_cli(
@@ -219,6 +275,7 @@ class AgentDelegateCliTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["assistant_text"], "delegated ok")
+        self.assertFalse(payload["assistant_text_truncated"])
         self.assertEqual(payload["stop_reason"], "end_turn")
         receipt = Path(payload["receipt_dir"])
         self.assertTrue((receipt / "request.json").is_file())
@@ -232,6 +289,52 @@ class AgentDelegateCliTests(unittest.TestCase):
             "Owner authorized this fixture mission within its prompt boundary.",
         )
         self.assertNotIn("return a short result", json.dumps(request))
+
+    def test_missing_result_limit_preserves_more_than_legacy_default(self) -> None:
+        self.acpx.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "sys.stdin.read()\n"
+            "text = 'x' * 20001 + 'TAIL'\n"
+            "print(json.dumps({'params': {'update': {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': text}}}}))\n"
+            "print(json.dumps({'result': {'stopReason': 'end_turn'}}))\n",
+            encoding="utf-8",
+        )
+        result = self.run_cli(
+            "run",
+            "--to",
+            "beta",
+            "--caller",
+            "alpha",
+            "--cwd",
+            str(self.cwd),
+            "--task",
+            "return the full result",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["assistant_text"], "x" * 20001 + "TAIL")
+        self.assertFalse(payload["assistant_text_truncated"])
+
+    def test_explicit_result_limit_is_enforced(self) -> None:
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["max_result_chars"] = 5
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        result = self.run_cli(
+            "run",
+            "--to",
+            "beta",
+            "--caller",
+            "alpha",
+            "--cwd",
+            str(self.cwd),
+            "--task",
+            "return a limited result",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["assistant_text"], "deleg")
+        self.assertTrue(payload["assistant_text_truncated"])
 
 
 if __name__ == "__main__":

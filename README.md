@@ -29,9 +29,9 @@ Any host CLI
 | Codex | `@agentclientprotocol/codex-acp@1.7.0` |
 | Kimi | Existing `kimi acp` |
 | zCode | Existing Ultra-pinned `zcode-acp` bridge |
-| OpenCode | Existing `opencode acp --pure` |
+| OpenCode | Existing `opencode acp` |
 
-`--pure` keeps delegated OpenCode sessions free of unrelated external plugins. Native user Skills remain available.
+Managed targets keep their normal tools and plugin surfaces. ZCode's adapter retains `--no-browser` only to prevent unattended interactive OAuth/device login; it does not disable ordinary web or network tools.
 
 The runtime lock pins:
 
@@ -106,8 +106,7 @@ agent-delegate run \
   --to kimi \
   --caller hermes \
   --cwd /absolute/task/root \
-  --task-file /absolute/delegation-envelope.md \
-  --authorization-note "Owner authorized this in-scope research mission; the envelope states its commit gates."
+  --task-file /absolute/delegation-envelope.md
 ```
 
 从已委派的 Agent 再委派时，wrapper 会注入 `AGENT_DELEGATION_CALLER`、`AGENT_DELEGATION_CHAIN` 和深度上限。直接自委派、回到链上已有 Agent、超过深度都会失败。
@@ -119,15 +118,18 @@ agent-delegate run \
 - `stderr.log`；
 - `result.json`：标准化状态、stop reason、最终文本和耗时。
 
+wrapper 默认不限制 task 或标准化结果的字符数，也不会在标准化时裁掉 Agent 结论。只有 owner 明确需要 wrapper 级限制时，才在 `~/.config/agent-delegation/config.json` 中配置正整数 `max_task_chars` 或 `max_result_chars`；字段缺失表示不设字符上限。目标模型或传输层的真实上下文错误由对应层报告，并保留在结构化结果或 receipt 中。
+
 ## 权限边界
 
 - 委派可以携带用户已经授予的权限，但不能创造新权限；不要仅因为换了 Agent 就重复索要同一授权。
-- capability 不等于 authority。普通委派默认 `approve-all` 并提供 Terminal，让目标保留网络、搜索和工具选择；Prompt 中明确 goal、requirements、已有授权和 commit gates。`--authorization-note` 记录这份已有授权与 Prompt 边界，但不创造授权。
+- capability 不等于 authority。普通委派默认 `approve-all` 并提供 Terminal，让目标保留网络、搜索、插件和工具选择；Prompt 中明确 goal、requirements、已有授权和 commit gates。`--authorization-note` 只是可选 receipt 信息，不是启动条件，也不创造授权。
 - `approve-reads`、`deny-all` 与 `--no-terminal` 是有意缩减能力时才使用的显式模式。例如需要限制时同时传 `--permissions approve-reads --no-terminal`；不要因为任务文字写了“只读”就顺手关闭 Agent 可能需要的 Shell 或网络。
 - ACPX 的 permission mode 无法理解任意命令的语义，也不要增加字符串 allowlist 假装能够判断。显式受限模式导致 permission failure 时，应把它作为真实 blocked 结果处理。
 - 发送、发布、部署、购买、交易、身份/权限变更、删除或凭据操作等 commit effect，只有在用户明确授权该具体动作和范围时才能随委派传递；否则只准备，不提交。
 - worker 拥有解法与探索自主权，但不能批准自己的副作用。transport exit `0` 只证明 ACP turn 完成；caller 按风险验证关键事实，不默认重做 worker 的工作。
 - `cwd`、Prompt、ACPX mode 和 authorization note 都不是 OS 沙箱；如果目标能触达高风险外部系统或不可逆效果，必须使用真实宿主隔离或 tool-specific policy，或不把该能力交给本次委派。
+- 默认和最大单次 timeout 都是 7200 秒（2 小时）；只有显式传入更小的 `--timeout` 才会缩短。
 
 ## 增加其他 ACP CLI
 

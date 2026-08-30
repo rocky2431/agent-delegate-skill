@@ -17,7 +17,9 @@ import tempfile
 from typing import Any
 
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
+DEFAULT_TIMEOUT_SECONDS = 7200
+MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_SOURCE = (
     REPO_ROOT
@@ -33,6 +35,10 @@ RUNTIME_PACKAGES = {
     "acpx": "0.13.2",
     "@agentclientprotocol/claude-agent-acp": "0.70.0",
     "@agentclientprotocol/codex-acp": "1.7.0",
+}
+LEGACY_DEFAULT_CHAR_LIMITS = {
+    "max_task_chars": 200000,
+    "max_result_chars": 20000,
 }
 
 
@@ -101,6 +107,12 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InstallError(f"Expected a JSON object in {path}.")
     return value
+
+
+def _remove_legacy_default_char_limits(registry: dict[str, Any]) -> None:
+    for key, legacy_default in LEGACY_DEFAULT_CHAR_LIMITS.items():
+        if registry.get(key) == legacy_default:
+            registry.pop(key)
 
 
 def _sha256(path: Path) -> str:
@@ -319,7 +331,7 @@ def _build_managed_targets(home: Path, runtime_root: Path) -> dict[str, dict[str
                 "--node",
                 str(node),
                 "--prompt-timeout-secs",
-                "900",
+                str(DEFAULT_TIMEOUT_SECONDS),
                 "--no-browser",
             ],
             "version_argv": [str(zcode_acp), "--version"],
@@ -327,10 +339,10 @@ def _build_managed_targets(home: Path, runtime_root: Path) -> dict[str, dict[str
             "provenance": "existing Ultra-pinned zcode-acp bridge with local ZCode bundle",
         },
         "opencode": {
-            "argv": [str(opencode), "acp", "--pure"],
+            "argv": [str(opencode), "acp"],
             "version_argv": [str(opencode), "--version"],
             "observed_version": _version_line([str(opencode), "--version"]),
-            "provenance": "existing local OpenCode installation with native ACP; external plugins disabled",
+            "provenance": "existing local OpenCode installation with native ACP",
         },
     }
 
@@ -367,11 +379,10 @@ def _merge_registry(
             "targets": targets,
         }
     )
-    registry.setdefault("default_timeout_seconds", 900)
-    registry.setdefault("max_timeout_seconds", 7200)
+    registry.setdefault("default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    registry.setdefault("max_timeout_seconds", MAX_TIMEOUT_SECONDS)
     registry.setdefault("max_delegation_depth", 4)
-    registry.setdefault("max_task_chars", 200000)
-    registry.setdefault("max_result_chars", 20000)
+    _remove_legacy_default_char_limits(registry)
 
     acpx = _read_json_object(acpx_path)
     agents = acpx.setdefault("agents", {})
@@ -382,9 +393,9 @@ def _merge_registry(
         if not isinstance(argv, list) or not argv:
             raise InstallError(f"Delegation target {name!r} has invalid argv.")
         agents[name] = {"argv": argv}
-    acpx.setdefault("defaultPermissions", "approve-reads")
+    acpx.setdefault("defaultPermissions", "approve-all")
     acpx.setdefault("nonInteractivePermissions", "fail")
-    acpx.setdefault("timeout", 900)
+    acpx.setdefault("timeout", DEFAULT_TIMEOUT_SECONDS)
     _atomic_write_json(registry_path, registry)
     _atomic_write_json(acpx_path, acpx)
     return registry_path, registry, acpx_path

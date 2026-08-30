@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "default_timeout_seconds": 900,
+  "default_timeout_seconds": 7200,
+  "max_timeout_seconds": 7200,
   "max_delegation_depth": 4,
-  "max_result_chars": 20000,
   "targets": {
     "example": {
       "argv": ["/absolute/path/to/example", "acp"],

@@ -1,6 +1,6 @@
 {
   "name": "agent-delegation",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Delegate meaningful missions between ACP-compatible agents while preserving worker agency and receipt-backed effect boundaries.",
   "author": {
     "name": "rocky2431",
