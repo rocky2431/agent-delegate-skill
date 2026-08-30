@@ -1,0 +1,20 @@
+{
+  "name": "agent-delegation",
+  "version": "0.1.0",
+  "description": "Delegate bounded, general-purpose tasks between ACP-compatible agents through a shared local contract.",
+  "author": {
+    "name": "rocky2431",
+    "url": "https://github.com/rocky2431"
+  },
+  "repository": "https://github.com/rocky2431/agent-delegate-skill",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Delegation",
+    "shortDescription": "Delegate bounded tasks across local agent CLIs.",
+    "longDescription": "Adds a provider-neutral Skill for handing arbitrary bounded tasks between Hermes, Claude Code, Codex, Kimi, zCode, OpenCode, and registered ACP agents through a pinned ACPX runtime.",
+    "developerName": "rocky2431",
+    "category": "Productivity",
+    "capabilities": ["Skills"],
+    "defaultPrompt": "Use $agent-delegation to hand this bounded task to the most suitable registered agent and return a receipt-backed result."
+  }
+}

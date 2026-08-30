@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "default_timeout_seconds": 900,
+  "max_delegation_depth": 4,
+  "max_result_chars": 20000,
+  "targets": {
+    "example": {
+      "argv": ["/absolute/path/to/example", "acp"],
+      "observed_version": "1.2.3",
+      "provenance": "official package example@1.2.3"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "rocky-agent-delegation",
+  "interface": {
+    "displayName": "Agent Delegation"
+  },
+  "plugins": [
+    {
+      "name": "agent-delegation",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agent-delegation"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
