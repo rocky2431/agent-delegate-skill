@@ -17,7 +17,7 @@ import tempfile
 from typing import Any
 
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_SOURCE = (
     REPO_ROOT

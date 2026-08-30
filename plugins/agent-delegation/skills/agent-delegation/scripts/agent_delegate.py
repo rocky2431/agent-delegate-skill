@@ -20,7 +20,7 @@ from typing import Any, Iterator
 import uuid
 
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SCHEMA_VERSION = 1
 TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESERVED_TARGETS = {
@@ -516,7 +516,7 @@ def _run_version_probe(argv: list[str]) -> tuple[bool, str]:
             argv,
             text=True,
             capture_output=True,
-            timeout=10,
+            timeout=30,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

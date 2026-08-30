@@ -1,6 +1,6 @@
 {
   "name": "agent-delegation",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Delegate bounded, general-purpose tasks between ACP-compatible agents through a shared local contract.",
   "author": {
     "name": "rocky2431",
