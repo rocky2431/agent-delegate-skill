@@ -1,8 +1,8 @@
 # Agent Delegation
 
-一个面向本机 Agent CLI 的通用任务委派层。它让 Hermes、Claude Code、Codex、Kimi、zCode、OpenCode，以及后续注册的 ACP CLI，使用同一份任务协议相互委派研究、分析、写作、运营、coding 等有边界的任务。
+一个面向本机 Agent CLI 的通用任务委派层。它让 Hermes、Claude Code、Codex、Kimi、zCode、OpenCode，以及后续注册的 ACP CLI，互相委派有意义的研究、分析、写作、运营和 coding 使命。
 
-它不是新的“总任务数据库”，也不是 coding-only orchestrator：发起方仍然拥有任务、审批和最终验收权。
+核心原则是“委派使命，不规定解法”：worker 在用户已经授权的范围内拥有解释、分解、探索、工具选择、策略和表达的自主权；wrapper 不会把 Prompt 中的任务边界误译成网络、Shell 或搜索禁用。它只机械约束调用链、预算、显式 capability mode 和 receipts。它不是新的“总任务数据库”，也不是 coding-only orchestrator。
 
 ```text
 Any host CLI
@@ -14,7 +14,7 @@ Any host CLI
 
 ## 为什么是 Skill + wrapper + ACPX
 
-- **Agent Skill**：告诉不同模型何时委派、怎样写 task packet、哪些权限不能继承。
+- **Agent Skill**：告诉不同模型何时委派、怎样表达 mission envelope，以及如何携带已有授权而不创造新授权。
 - **`agent-delegate`**：机械执行 cwd、timeout、permission mode、私有 receipt、调用链和循环保护。
 - **ACPX**：负责 ACP 初始化、临时 session、prompt、取消、结构化事件和稳定退出码。
 
@@ -99,15 +99,15 @@ agent-delegate list --json
 agent-delegate doctor --json
 ```
 
-从 Hermes 委派一个只读的一般任务给 Kimi：
+从 Hermes 委派一个研究使命给 Kimi：
 
 ```bash
 agent-delegate run \
   --to kimi \
   --caller hermes \
   --cwd /absolute/task/root \
-  --task-file /absolute/task-packet.md \
-  --permissions approve-reads
+  --task-file /absolute/delegation-envelope.md \
+  --authorization-note "Owner authorized this in-scope research mission; the envelope states its commit gates."
 ```
 
 从已委派的 Agent 再委派时，wrapper 会注入 `AGENT_DELEGATION_CALLER`、`AGENT_DELEGATION_CHAIN` 和深度上限。直接自委派、回到链上已有 Agent、超过深度都会失败。
@@ -121,11 +121,13 @@ agent-delegate run \
 
 ## 权限边界
 
-- 默认 `approve-reads`，非交互写入升级 fail closed。
-- `deny-all` 用于不需要工具的推理。
-- `approve-all` 或 `--terminal` 必须带真实 `--authorization-note`。
-- worker 不继承发送、发布、部署、购买、交易、身份/权限变更、删除或凭据操作的授权。
-- transport exit `0` 只证明 ACP turn 完成；caller 仍需验收结果和证据。
+- 委派可以携带用户已经授予的权限，但不能创造新权限；不要仅因为换了 Agent 就重复索要同一授权。
+- capability 不等于 authority。普通委派默认 `approve-all` 并提供 Terminal，让目标保留网络、搜索和工具选择；Prompt 中明确 goal、requirements、已有授权和 commit gates。`--authorization-note` 记录这份已有授权与 Prompt 边界，但不创造授权。
+- `approve-reads`、`deny-all` 与 `--no-terminal` 是有意缩减能力时才使用的显式模式。例如需要限制时同时传 `--permissions approve-reads --no-terminal`；不要因为任务文字写了“只读”就顺手关闭 Agent 可能需要的 Shell 或网络。
+- ACPX 的 permission mode 无法理解任意命令的语义，也不要增加字符串 allowlist 假装能够判断。显式受限模式导致 permission failure 时，应把它作为真实 blocked 结果处理。
+- 发送、发布、部署、购买、交易、身份/权限变更、删除或凭据操作等 commit effect，只有在用户明确授权该具体动作和范围时才能随委派传递；否则只准备，不提交。
+- worker 拥有解法与探索自主权，但不能批准自己的副作用。transport exit `0` 只证明 ACP turn 完成；caller 按风险验证关键事实，不默认重做 worker 的工作。
+- `cwd`、Prompt、ACPX mode 和 authorization note 都不是 OS 沙箱；如果目标能触达高风险外部系统或不可逆效果，必须使用真实宿主隔离或 tool-specific policy，或不把该能力交给本次委派。
 
 ## 增加其他 ACP CLI
 

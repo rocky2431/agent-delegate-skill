@@ -19,7 +19,8 @@ Fix only the failed layer:
 - missing Skill: rerun the installer for that host;
 - missing runtime package: rerun `python3 scripts/install_user.py install --hosts none` from a reviewed checkout;
 - registry mismatch: rerun the installer or repeat an explicit `agent-delegate register` operation;
-- provider authentication failure: repair that provider directly without copying credentials into task packets or receipts.
+- provider authentication failure: repair that provider directly without copying credentials into mission envelopes or receipts.
+- `PERMISSION_PROMPT_UNAVAILABLE` during an explicitly restricted `approve-reads` or `deny-all` mission: inspect the receipt before retrying. Some targets use Shell or network access for ordinary discovery, and ACPX does not classify arbitrary commands by semantic effect. Remove the unintended restriction only when the prompt boundary and owner-controlled or actually sandboxed environment make normal capabilities appropriate; otherwise keep the result blocked. Do not add a command-text allowlist that pretends to prove shell semantics.
 
 Normal task execution must not use `npx -y` or an unpinned remote package fallback.
 

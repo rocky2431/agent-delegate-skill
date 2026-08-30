@@ -77,8 +77,13 @@ class AgentDelegateCliTests(unittest.TestCase):
             json.dumps({"agents": {name: {"argv": record["argv"]} for name, record in targets.items()}}),
             encoding="utf-8",
         )
+        clean_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("AGENT_DELEGATION_")
+        }
         self.environment = {
-            **os.environ,
+            **clean_environment,
             "AGENT_DELEGATION_CONFIG": str(self.registry),
             "AGENT_DELEGATION_HOME": str(self.root),
         }
@@ -96,7 +101,7 @@ class AgentDelegateCliTests(unittest.TestCase):
             check=False,
         )
 
-    def test_dry_run_builds_bounded_chain_without_executing(self) -> None:
+    def test_dry_run_preserves_normal_capabilities_without_executing(self) -> None:
         result = self.run_cli(
             "run",
             "--to",
@@ -107,13 +112,41 @@ class AgentDelegateCliTests(unittest.TestCase):
             str(self.cwd),
             "--task",
             "summarize the input",
+            "--authorization-note",
+            "Owner authorized this fixture mission within its prompt boundary.",
             "--dry-run",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["chain"], ["alpha", "beta"])
-        self.assertEqual(payload["permissions"], "approve-reads")
+        self.assertEqual(payload["permissions"], "approve-all")
+        self.assertTrue(payload["terminal"])
+        self.assertIn("--approve-all", payload["command"])
+        self.assertNotIn("--no-terminal", payload["command"])
         self.assertFalse((self.root / "receipts").exists())
+
+    def test_explicit_restricted_mode_removes_terminal_without_authorization_note(self) -> None:
+        result = self.run_cli(
+            "run",
+            "--to",
+            "beta",
+            "--caller",
+            "alpha",
+            "--cwd",
+            str(self.cwd),
+            "--task",
+            "reason without shell access",
+            "--permissions",
+            "approve-reads",
+            "--no-terminal",
+            "--dry-run",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["permissions"], "approve-reads")
+        self.assertFalse(payload["terminal"])
+        self.assertIn("--approve-reads", payload["command"])
+        self.assertIn("--no-terminal", payload["command"])
 
     def test_direct_self_delegation_is_rejected(self) -> None:
         result = self.run_cli(
@@ -152,7 +185,7 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("already appears", result.stderr)
 
-    def test_elevated_execution_requires_authorization_note(self) -> None:
+    def test_full_capability_default_requires_authorization_note(self) -> None:
         result = self.run_cli(
             "run",
             "--to",
@@ -163,8 +196,6 @@ class AgentDelegateCliTests(unittest.TestCase):
             str(self.cwd),
             "--task",
             "change something",
-            "--permissions",
-            "approve-all",
             "--dry-run",
         )
         self.assertEqual(result.returncode, 2)
@@ -181,6 +212,8 @@ class AgentDelegateCliTests(unittest.TestCase):
             str(self.cwd),
             "--task",
             "return a short result",
+            "--authorization-note",
+            "Owner authorized this fixture mission within its prompt boundary.",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
@@ -192,6 +225,12 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertTrue((receipt / "events.ndjson").is_file())
         self.assertTrue((receipt / "result.json").is_file())
         request = json.loads((receipt / "request.json").read_text(encoding="utf-8"))
+        self.assertEqual(request["permissions"], "approve-all")
+        self.assertTrue(request["terminal"])
+        self.assertEqual(
+            request["authorization_note"],
+            "Owner authorized this fixture mission within its prompt boundary.",
+        )
         self.assertNotIn("return a short result", json.dumps(request))
 
 

@@ -1,30 +1,38 @@
-# Task Packet
+# Delegation Envelope
 
-Use a packet when the delegation needs more than one short instruction.
+Use an envelope when the delegation needs more than one short instruction. It defines the mission, inherited authority, and commit gates; it does not prescribe the worker's reasoning or solution path.
 
 ```markdown
-# Delegated task
+# Delegated mission
 
-## Objective
-One independently completable outcome.
+## Goal
+- The user outcome or problem to own.
 
-## Context and inputs
-- Exact source paths, URLs, revisions, or facts the worker may use.
+## Requirements and boundaries
+- Requirements the result must satisfy and boundaries the worker must respect.
+- State outcome or effect constraints without prescribing the reasoning or tool sequence.
 
-## Included scope
-- Work the worker may perform.
+## Context
+- Relevant facts, source paths, URLs, revisions, and prior decisions.
+- Suggested leads may be included, but they are not mandatory steps unless explicitly stated.
 
-## Excluded scope
-- Work and side effects the worker must return to the caller.
+## Authority already granted
+- Reads, edits, tests, tools, network use, or other effects already authorized by the owner.
+- The concrete owner request or approval that supplies this authority when effects are involved.
 
-## Permissions
-- Allowed reads, writes, tools, network access, and external effects.
-- Owner approval reference when an effect was explicitly authorized.
+## Commit gates
+- Only the specific external, irreversible, privileged, or otherwise ungranted effects that require approval before execution.
 
-## Expected result
-- Output schema or artifact path.
-- Evidence and validation required.
+## Capability exceptions (optional)
+- List only capabilities the owner or execution environment intentionally removes.
+- Omit this section to preserve the target's normal tools, Terminal, network, and search capabilities.
+
+## Done
+- Observable outcome, artifact, or evidence that establishes completion.
+- An exact output schema only when a real machine consumer requires it.
 - How to report partial completion or blockers.
 ```
 
-Pass facts and source references, not the entire parent conversation or ambient secrets. A packet may narrow inherited authority but cannot expand it. The worker must return an explicit incomplete or approval-required result instead of silently widening scope.
+Within this envelope, the worker owns interpretation, decomposition, strategy, exploration, tool choice, and necessary related work. It may challenge assumptions, revise the plan, and propose a better framing or alternative solution.
+
+Pass relevant facts and source references, not the entire parent conversation or ambient secrets. An envelope may carry or narrow authority already granted by the owner but cannot create new authority. Tool availability is not a grant to use it for effects outside the envelope. The worker may widen analysis freely; when an additional effect needs approval, it should continue unrelated work and pause only before that exact effect.

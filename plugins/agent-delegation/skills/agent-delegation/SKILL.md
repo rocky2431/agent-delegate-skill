@@ -1,26 +1,34 @@
 ---
 name: agent-delegation
-description: Use when delegating a bounded research, analysis, writing, operations, or coding task between Hermes, Claude Code, Codex, Kimi, zCode, OpenCode, or another registered ACP agent while preserving caller authority, permissions, receipts, and cycle limits.
+description: Use when handing a meaningful research, analysis, writing, operations, or coding mission between Hermes, Claude Code, Codex, Kimi, zCode, OpenCode, or another registered ACP agent while preserving worker agency, inherited authority, effect gates, receipts, and cycle limits.
 ---
 
 # Agent Delegation
 
-Use `agent-delegate` as the normal cross-agent entry point. ACPX is the transport; this Skill defines when a delegation is useful and the wrapper enforces the mechanical boundary.
+Delegate a mission, not a procedure. Use `agent-delegate` as the normal cross-agent entry point. ACPX is the transport; this Skill preserves the worker's freedom to solve the problem while the wrapper enforces exact runtime contracts.
 
 ## Delegate when
 
 - another registered agent has materially better context, tools, model access, or an already-useful session boundary;
-- a bounded packet can be completed independently and returned to the caller;
-- the caller can state the expected output and evidence without transferring ownership of the whole task.
+- a meaningful outcome or problem can be handed over, rather than a trivial instruction that the caller can complete just as well;
+- the caller can state the goal, relevant context, existing authorization, and observable completion without prescribing the solution.
 
-Do not delegate merely to create activity, evade a permission boundary, or replace a simple direct step. Delegation is not limited to coding.
+Do not delegate merely to create activity or evade a permission boundary. Have a concrete reason for choosing the target, but do not turn target selection into a scripted quality score or routing gate. Delegation is not limited to coding.
+
+## Agency boundary
+
+Inside the authority already granted by the owner, the worker owns interpretation, decomposition, strategy, exploration, tool choice, prioritization, and expression. It may inspect adjacent context, challenge assumptions, revise the plan, perform necessary related work, and return a better framing or alternative solution.
+
+Suggested steps and files are starting points, not constraints, unless the owner made them explicit requirements. Require an exact output schema only when a real machine consumer needs it. A denied effect must not prevent unrelated reasoning, drafting, or preparation from continuing.
+
+The caller remains accountable for the overall user outcome and for effects that were not delegated. It should integrate the worker's result and verify decision-critical evidence in proportion to risk, not redo the delegated work by default.
 
 ## Procedure
 
 1. Run `agent-delegate list --json` when the available targets are not already known. Run `agent-delegate doctor --json` after installation changes or when a target fails to start.
-2. Keep the caller as the task authority. Choose the target semantically; do not encode task quality or target suitability into scripts.
-3. Prepare one bounded task packet. Read [references/task-packet.md](references/task-packet.md) when the packet has dependencies, side effects, or a required output schema.
-4. Use a fixed existing `--cwd`, a finite `--timeout`, and the least capable permission mode that can complete the packet.
+2. Choose the target semantically and give it a meaningful slice of the outcome. State the capability or context advantage that makes the handoff useful.
+3. Send a concise mission. Read [references/task-packet.md](references/task-packet.md) when the handoff needs several inputs, carries existing effect authorization, has commit gates, or feeds a machine consumer.
+4. Use a fixed existing `--cwd` and a finite `--timeout`. Preserve the target's normal tool, Terminal, and network capabilities unless the owner or the actual execution environment requires a capability reduction. Do not translate a semantic prompt boundary into unrelated tool bans.
 5. Run the task. Prefer a task file for long or sensitive instructions:
 
    ```bash
@@ -28,21 +36,28 @@ Do not delegate merely to create activity, evade a permission boundary, or repla
      --to codex \
      --caller hermes \
      --cwd /absolute/task/root \
-     --task-file /absolute/task-packet.md \
-     --permissions approve-reads
+     --task-file /absolute/delegation-envelope.md \
+     --authorization-note "Owner authorized this in-scope mission; the envelope states its commit gates."
    ```
 
    A nested delegated agent should rely on the injected `AGENT_DELEGATION_CALLER` and `AGENT_DELEGATION_CHAIN` environment when available. If the host drops them, pass the current host with `--caller` and the received chain with `--chain`.
-6. Inspect the structured result and receipt. A zero exit code proves transport completion, not semantic correctness. The caller remains responsible for validating evidence, integrating the result, and reporting incomplete work.
+6. Inspect the structured result and receipt. A zero exit code proves transport completion, not semantic correctness. Validate observable claims in proportion to risk, integrate the result, and report material incomplete work.
 
 ## Authority and permissions
 
-- `deny-all`: reasoning without approved tool access.
-- `approve-reads`: default; auto-approve ACP read/search requests and fail closed on non-interactive escalation.
-- `approve-all`: only after the owner explicitly authorizes the concrete side effects. Pass the real approval basis with `--authorization-note`; never invent one.
-- `--terminal`: process execution capability. It also requires an explicit `--authorization-note`.
+- Delegation may carry authority the owner already granted; it never creates new authority. Record the real basis instead of asking the owner to approve the same in-scope work again.
+- Capability is not authority. Normal delegation keeps the target's ordinary tools, Terminal, and network access available so it can choose its own exploration and solution path. The mission prompt defines the goal, requirements, inherited authority, and effects that still need approval.
+- The wrapper therefore defaults to `approve-all` with Terminal advertised. Supply a concrete `--authorization-note` that records the existing owner request and prompt boundary; the note is an audit fact, not new authorization.
+- `deny-all`: use for transport smokes or genuinely tool-free reasoning, not as the normal delegation mode.
+- `approve-reads`: an explicit restriction for work known to stay on ACP read/search requests. A target that chooses Shell even for read-only discovery will fail closed in non-interactive mode.
+- `--no-terminal`: an explicit capability reduction. Pair it with the intended restricted permission mode; do not use it merely because a mission is described as read-only.
+- `approve-all` and Terminal availability let ACP carry the target's tool choices; they do not authorize every effect those tools could produce.
 
-The worker never inherits authority to send messages, publish, deploy, purchase, trade, change identity/access, delete data, rotate credentials, or approve its own effects. Split preparation from commitment and return approval-required work to the caller.
+Sending messages, publishing, deploying, purchasing, trading, changing identity or access, deleting data, and rotating credentials are examples of commit effects: carry them only when the owner explicitly authorized that exact effect and scope. Otherwise the worker may prepare the action but must pause before commitment. A worker can never approve its own effects.
+
+`--cwd` supplies task context; it is not an operating-system sandbox. Prompt gates are appropriate for ordinary work in an owner-controlled environment. If the target can reach high-risk external systems or irreversible effects, use real host isolation or a tool-specific policy, or keep that capability outside the delegation; neither ACPX's coarse modes nor an authorization note can prove semantic safety.
+
+Do not add command-text allowlists that pretend to infer whether arbitrary Shell or network use is semantically safe. When capability restriction is intentional, invoke it explicitly, for example `--permissions approve-reads --no-terminal`, and treat any resulting permission failure as an honest blocked result.
 
 ## Delegation chain
 

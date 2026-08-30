@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Delegation"
-  short_description: "Delegate bounded tasks across local agent CLIs"
-  default_prompt: "Use $agent-delegation to delegate this bounded task and return a receipt-backed result."
+  short_description: "Delegate missions without disabling agent capabilities"
+  default_prompt: "Use $agent-delegation to hand this mission to the most suitable agent, preserve its normal tools and freedom of approach within my stated boundary and existing authorization, and return a receipt-backed result."

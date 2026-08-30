@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, receipt-backed task delegation through a pinned ACPX runtime."""
+"""Receipt-backed mission delegation through a pinned ACPX runtime."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from typing import Any, Iterator
 import uuid
 
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SCHEMA_VERSION = 1
 TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESERVED_TARGETS = {
@@ -43,7 +43,7 @@ PERMISSION_FLAGS = {
 
 
 class DelegationError(RuntimeError):
-    """A bounded user-facing delegation failure."""
+    """A user-facing delegation failure."""
 
 
 def _home() -> Path:
@@ -235,7 +235,11 @@ def _delegation_context(
         "cwd": str(cwd),
         "permissions": permissions,
         "terminal": terminal,
-        "authority": "The caller retains task ownership and approvals; do not expand scope or side effects.",
+        "authority": (
+            "Available transport capabilities do not create authority. Follow the mission's "
+            "explicit goal, requirements, inherited authority, and commit gates; pause only "
+            "before an ungranted effect."
+        ),
     }
     return (
         "<agent-delegation-context>\n"
@@ -349,9 +353,12 @@ def _run(args: argparse.Namespace) -> int:
         raise DelegationError(f"timeout must be between 1 and {max_timeout} seconds.")
 
     permissions = args.permissions
-    if (permissions == "approve-all" or args.terminal) and not args.authorization_note:
+    if (permissions == "approve-all" or args.terminal) and not (
+        args.authorization_note and args.authorization_note.strip()
+    ):
         raise DelegationError(
-            "approve-all and terminal execution require a concrete --authorization-note from the caller."
+            "Full-capability delegation requires a concrete --authorization-note that records "
+            "the existing owner authority and task boundary."
         )
 
     max_task_chars = int(registry.get("max_task_chars", 200000))
@@ -659,7 +666,7 @@ def _register(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-delegate",
-        description="Delegate bounded tasks through a pinned ACPX runtime.",
+        description="Delegate missions through a pinned ACPX runtime.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -680,17 +687,33 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--cwd", required=True, help="Existing absolute or resolvable task directory.")
     task_group = run_parser.add_mutually_exclusive_group()
     task_group.add_argument("--task", help="Short task text; prefer --task-file for long packets.")
-    task_group.add_argument("--task-file", help="UTF-8 task packet path, or pipe task text on stdin.")
+    task_group.add_argument("--task-file", help="UTF-8 mission envelope path, or pipe mission text on stdin.")
     run_parser.add_argument("--timeout", type=int, help="Timeout in seconds.")
     run_parser.add_argument(
         "--permissions",
         choices=sorted(PERMISSION_FLAGS),
-        default="approve-reads",
+        default="approve-all",
+        help="ACPX transport policy; defaults to preserving the target's normal capabilities.",
     )
-    run_parser.add_argument("--terminal", action="store_true", help="Advertise ACP terminal capability.")
-    run_parser.add_argument("--authorization-note", help="Concrete owner authorization for elevated effects.")
+    terminal_group = run_parser.add_mutually_exclusive_group()
+    terminal_group.add_argument(
+        "--terminal",
+        dest="terminal",
+        action="store_true",
+        help="Advertise ACP terminal capability (default).",
+    )
+    terminal_group.add_argument(
+        "--no-terminal",
+        dest="terminal",
+        action="store_false",
+        help="Explicitly remove ACP terminal capability for a restricted mission.",
+    )
+    run_parser.add_argument(
+        "--authorization-note",
+        help="Existing owner authority and prompt boundary recorded for full-capability transport.",
+    )
     run_parser.add_argument("--dry-run", action="store_true", help="Validate and print the launch plan only.")
-    run_parser.set_defaults(handler=_run)
+    run_parser.set_defaults(terminal=True, handler=_run)
 
     register_parser = subparsers.add_parser("register", help="Register an additional reviewed ACP target.")
     register_parser.add_argument("--name", required=True)
