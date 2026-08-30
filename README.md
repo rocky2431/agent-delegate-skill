@@ -158,6 +158,6 @@ python3 scripts/install_user.py uninstall --remove-runtime
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 /Users/rocky243/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" \
   plugins/agent-delegation/skills/agent-delegation
 ```
