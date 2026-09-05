@@ -1,6 +1,6 @@
 {
   "name": "agent-delegation-runtime",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "Pinned ACP runtime for the agent-delegation Skill.",
   "dependencies": {

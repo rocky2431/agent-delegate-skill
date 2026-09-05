@@ -93,37 +93,55 @@ codex plugin add agent-delegation@rocky-agent-delegation
 
 ## 使用
 
-查看和检查目标：
+查看可用目标；遇到故障时再用 `doctor --to <target> --json` 诊断：
 
 ```bash
 agent-delegate list --json
-agent-delegate doctor --json
 ```
 
 从 Hermes 委派一个研究使命给 Kimi：
 
 ```bash
-agent-delegate run \
+agent-delegate submit \
   --to kimi \
   --caller hermes \
   --cwd /absolute/task/root \
   --task-file /absolute/delegation-envelope.md
 ```
 
+保存返回的 `delegation_id`，用完整 ID 等待和取回结果：
+
+```bash
+agent-delegate wait --id <delegation_id> --timeout 30
+```
+
+`terminal: false` 表示任务还没有结果；`wait_timed_out: true` 只表示这次等待结束，任务继续运行。继续等待同一个 ID，也可以先做独立工作再回来查询；不要因等待超时而重复派发或取消。`status --id <delegation_id>` 可立即查询进度，完成后返回完整结果。命令退出码为 0 不等于任务完成，需要读取 JSON 的 `terminal` 和 `status`。
+
 从已委派的 Agent 再委派时，wrapper 会注入 `AGENT_DELEGATION_CALLER`、`AGENT_DELEGATION_CHAIN` 和深度上限。同名 Agent 可以启动独立任务，调用链也允许重复名称；来源标识不要求同时注册为可调用目标。深度预算仍会生效。
 
 需要多轮工作时使用命名会话，后续沿用同一 target、cwd 和 session：
 
 ```bash
-agent-delegate run --to codex --caller hermes --cwd /absolute/task/root \
+agent-delegate submit --to codex --caller hermes --cwd /absolute/task/root \
   --session review --task 'Investigate the issue and identify missing information.'
-agent-delegate run --to codex --caller hermes --cwd /absolute/task/root \
-  --session review --task 'Here is the detail. Continue.'
-agent-delegate cancel --to codex --cwd /absolute/task/root --session review
-agent-delegate close --to codex --cwd /absolute/task/root --session review
 ```
 
-同一会话的 wrapper 调用自动等待前一项完成；取消等待中的调用不会取消正在执行的任务，不同独立任务仍可并行。等待计入时间预算。省略 `--session` 使用一次性会话。`--model` 透传明确选择的模型；省略时保留目标默认设置，不会继承调用方的模型或完整对话。
+取回该任务的结果后，如需继续这段对话，再提交一个新任务：
+
+```bash
+agent-delegate submit --to codex --caller hermes --cwd /absolute/task/root \
+  --session review --task 'Here is the detail. Continue.'
+```
+
+同一会话的 wrapper 调用自动排队，不消耗执行预算。`submit --timeout` 控制执行时间，省略时沿用 registry；可选 `--queue-timeout` 单独限制排队，默认没有排队期限；`wait --timeout` 仅限制一次观察。不同独立任务可并行，省略 `--session` 使用一次性会话，不要仅因都派给 zCode 就共用会话名。`--model` 透传明确选择的模型；省略时保留目标默认设置，不会继承调用方的模型或完整对话。
+
+确实需要停止某个任务时，按 ID 取消，然后继续查询该 ID 的最终状态：
+
+```bash
+agent-delegate cancel --id <delegation_id>
+```
+
+取消确认不代表任务已经停止。按 ID 取消排队任务不会取消正在执行的另一项；`incomplete` 或 `execution_state: unknown` 需要先检查原始事件和已产生的结果，再决定是否重试。同步 `run`、按会话取消和关闭是其他操作，见 [operations.md](plugins/agent-delegation/skills/agent-delegation/references/operations.md)。
 
 运行时直接把 registry 中的 argv 传给 ACPX，项目或全局 alias 不会替换实际 executable。`doctor --to codex --json` 只检查指定目标并显示有效预算；旧版本探针是诊断信息，不再阻断健康目标。
 
@@ -132,7 +150,10 @@ agent-delegate close --to codex --cwd /absolute/task/root --session review
 - `request.json`：边界、hash、启动 argv、会话与模型选择；不保存原始 task 文本；
 - `events.ndjson`：运行中持续落盘的 ACPX 事件，日志中的读取原文默认被抑制；
 - `stderr.log`：运行中持续落盘的诊断；
+- `state.json`：任务 ID、当前阶段和计时；`worker.log` 保留异步 wrapper 诊断；
 - `result.json`：传输终态、stop reason、文本和原始内容块、会话身份、结构化错误和耗时。
+
+`status`、`wait` 和按 ID 取消共用原任务的收据。结果分别记录排队与执行耗时，超时会标记 `queue`、`setup` 或 `execution` 阶段。`submit` 临时用私有 `launch.json` 传递含 mission 的启动计划，worker 读取后删除。
 
 wrapper 默认不限制 task 或结果字符数。可选正整数 `max_task_chars` 限制输入，`max_result_chars` 只限制便于阅读的 `assistant_text` 字段；原始内容块和事件仍完整保留。配置在启动前校验，超时或取消保留已产生的部分结果。
 

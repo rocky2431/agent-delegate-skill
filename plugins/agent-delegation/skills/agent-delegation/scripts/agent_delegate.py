@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -379,7 +379,8 @@ def _stop_process(process: subprocess.Popen) -> None:
 
 def _stream_command(command: list[str], prompt: str, env: dict[str, str], timeout: float,
                     stdout: Any, stderr: Any,
-                    on_interrupt: Callable[[], None] | None = None) -> tuple[int, str | None]:
+                    on_interrupt: Callable[[], None] | None = None,
+                    is_cancelled: Callable[[], bool] | None = None) -> tuple[int, str | None]:
     # File descriptors preserve streamed bytes even when the process is interrupted.
     with tempfile.TemporaryFile() as task_input:
         task_input.write(prompt.encode("utf-8"))
@@ -387,18 +388,33 @@ def _stream_command(command: list[str], prompt: str, env: dict[str, str], timeou
         process = subprocess.Popen(command, stdin=task_input, stdout=stdout, stderr=stderr,
                                    env=env, start_new_session=True)
         try:
-            return process.wait(timeout=max(0.001, timeout)), None
+            deadline = time.monotonic() + timeout
+            while True:
+                if is_cancelled and is_cancelled():
+                    raise KeyboardInterrupt
+                remaining = max(0.001, deadline - time.monotonic())
+                try:
+                    return process.wait(timeout=min(0.1, remaining) if is_cancelled else remaining), None
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise
         except subprocess.TimeoutExpired:
             code, reason = 124, "timeout"
         except KeyboardInterrupt:
             code, reason = 130, "cancelled"
         if on_interrupt:
-            on_interrupt()
-            try:
-                # Keep the waiting client alive to receive the turn's terminal event.
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                _stop_process(process)
+            # Startup may not have registered the native turn at the first cancel.
+            # Keep ownership and the client until it confirms a terminal event.
+            cancel_deadline = time.monotonic() + 10
+            while True:
+                on_interrupt()
+                try:
+                    process.wait(timeout=max(0.001, min(1, cancel_deadline - time.monotonic())))
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= cancel_deadline:
+                        _stop_process(process)
+                        break
         else:
             _stop_process(process)
         return code, reason
@@ -406,7 +422,8 @@ def _stream_command(command: list[str], prompt: str, env: dict[str, str], timeou
 
 @contextmanager
 def _session_turn_lock(receipt_dir: Path, argv: list[str], cwd: Path,
-                       session: str | None, deadline: float) -> Iterator[None]:
+                       session: str | None, deadline: float | None,
+                       is_cancelled: Callable[[], bool] | None = None) -> Iterator[None]:
     if session is None:
         yield
         return
@@ -420,6 +437,10 @@ def _session_turn_lock(receipt_dir: Path, argv: list[str], cwd: Path,
         os.chmod(lock_path, 0o600)
         waiting = False
         while True:
+            if is_cancelled and is_cancelled():
+                raise KeyboardInterrupt
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for the session's current turn.")
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
@@ -428,8 +449,6 @@ def _session_turn_lock(receipt_dir: Path, argv: list[str], cwd: Path,
                     print(json.dumps({"status": "waiting", "session_name": session,
                                       "receipt_dir": str(receipt_dir)}), file=sys.stderr, flush=True)
                     waiting = True
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Timed out waiting for the session's current turn.")
                 time.sleep(0.1)
         # Closing the descriptor releases the lock, including on interruption.
         yield
@@ -446,7 +465,7 @@ def _normalized_exit_code(code: int) -> int:
     return code if 0 <= code <= 125 else 1
 
 
-def _run(args: argparse.Namespace) -> int:
+def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     _, registry = _load_registry()
     target = _target(registry, args.to)
     control = args.command in ("cancel", "close")
@@ -469,6 +488,9 @@ def _run(args: argparse.Namespace) -> int:
     max_timeout = timeout if control else _positive_int(registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS), "max_timeout_seconds")
     if timeout < 1 or timeout > max_timeout:
         raise DelegationError(f"timeout must be between 1 and {max_timeout} seconds.")
+    queue_timeout = getattr(args, "queue_timeout", None)
+    if queue_timeout is not None:
+        queue_timeout = _positive_int(queue_timeout, "queue-timeout")
     max_task_chars = None if control else _configured_char_limit(registry, "max_task_chars")
     max_result_chars = None if control else _configured_char_limit(registry, "max_result_chars")
     task, task_source = ("", "control") if control else _read_task(args, cwd, max_task_chars)
@@ -506,24 +528,86 @@ def _run(args: argparse.Namespace) -> int:
         "schema": "agent-delegation-request/v1", "delegation_id": delegation_id,
         "created_at": datetime.now(UTC).isoformat(), "caller": caller, "target": args.to,
         "chain": [*chain, args.to], "cwd": str(cwd), "timeout_seconds": timeout,
+        "queue_timeout_seconds": queue_timeout, "max_depth": max_depth,
         "permissions": args.permissions, "terminal": args.terminal,
         "authorization_note": args.authorization_note, "task_source": task_source,
         "task_chars": len(task), "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
         "target_argv": target["argv"], "session_name": args.session, "requested_model": args.model,
         "operation": args.command,
     }
+    return registry, {"request": request, "commands": commands, "max_result_chars": max_result_chars}
+
+
+def _run(args: argparse.Namespace) -> int:
+    registry, launch = _prepare_run(args)
+    request, commands = launch["request"], launch["commands"]
     if args.dry_run:
         print(json.dumps({**request, "status": "dry_run", "command": commands[-1][0],
                           "commands": [command for command, _ in commands]}, ensure_ascii=False, indent=2))
         return 0
-    receipt_dir = _new_receipt_dir(registry, delegation_id)
+    receipt_dir = _new_receipt_dir(registry, request["delegation_id"])
     _atomic_write_json(receipt_dir / "request.json", request)
-    child_env = {**os.environ, "AGENT_DELEGATION_CALLER": args.to,
-                 "AGENT_DELEGATION_CHAIN": ",".join([*chain, args.to]),
-                 "AGENT_DELEGATION_MAX_DEPTH": str(max_depth)}
-    print(json.dumps({"status": "running", "delegation_id": delegation_id,
-                      "receipt_dir": str(receipt_dir)}), file=sys.stderr, flush=True)
-    started = time.monotonic()
+    # The inherited descriptor keeps ownership continuous across background startup.
+    # Closing the parent's copy must not explicitly unlock the worker's copy.
+    with (receipt_dir / "worker.lock").open("xb") as owner:
+        os.chmod(owner.name, 0o600)
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX)
+        _atomic_write_json(receipt_dir / "state.json", {
+            "schema": "agent-delegation-status/v1", "status": "starting", "terminal": False,
+            "delegation_id": request["delegation_id"], "receipt_dir": str(receipt_dir),
+            "target": request["target"], "session_name": request["session_name"],
+            "created_at": request["created_at"], "created_monotonic": time.monotonic(),
+            "queue_wait_seconds": 0, "execution_seconds": 0,
+        })
+        print(json.dumps({"status": "starting", "delegation_id": request["delegation_id"],
+                          "receipt_dir": str(receipt_dir)}), file=sys.stderr, flush=True)
+        if args.command == "submit":
+            _atomic_write_json(receipt_dir / "launch.json", launch)
+            with (receipt_dir / "worker.log").open("xb", buffering=0) as log:
+                os.chmod(log.name, 0o600)
+                try:
+                    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_worker",
+                                      "--receipt-dir", str(receipt_dir), "--owner-fd", str(owner.fileno())],
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     start_new_session=True, pass_fds=(owner.fileno(),))
+                except OSError:
+                    (receipt_dir / "launch.json").unlink(missing_ok=True)
+                    raise
+            print(json.dumps(_task_snapshot(receipt_dir), ensure_ascii=False, indent=2))
+            return 0
+        return _execute_run(receipt_dir, launch)
+
+
+def _worker(args: argparse.Namespace) -> int:
+    receipt_dir = Path(args.receipt_dir)
+    with os.fdopen(args.owner_fd, "rb"):
+        launch = _read_json_object(receipt_dir / "launch.json")
+        (receipt_dir / "launch.json").unlink()
+        return _execute_run(receipt_dir, launch)
+
+
+def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
+    request, commands = launch["request"], launch["commands"]
+    timeout, session = request["timeout_seconds"], request["session_name"]
+    control = request["operation"] in ("cancel", "close")
+    child_env = {**os.environ, "AGENT_DELEGATION_CALLER": request["target"],
+                 "AGENT_DELEGATION_CHAIN": ",".join(request["chain"]),
+                 "AGENT_DELEGATION_MAX_DEPTH": str(request["max_depth"])}
+    state = _read_json_object(receipt_dir / "state.json")
+    started = state["created_monotonic"]
+    execution_started = None
+    queue_wait = 0.0
+    phase = "setup"
+    def set_phase(status: str) -> None:
+        state.update(status=status, phase_started_monotonic=time.monotonic(),
+                     queue_wait_seconds=round(queue_wait, 3), worker_pid=os.getpid())
+        if status == "running":
+            state["execution_started_at"] = datetime.now(UTC).isoformat()
+        _atomic_write_json(receipt_dir / "state.json", state)
+        print(json.dumps({"status": status, "delegation_id": request["delegation_id"],
+                          "receipt_dir": str(receipt_dir)}), file=sys.stderr, flush=True)
+    def is_cancelled() -> bool:
+        return (receipt_dir / "cancel.json").exists()
     return_code, interrupted, launch_error, cancellation_exit_code = 1, None, None, None
     def handle_termination(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt
@@ -535,27 +619,43 @@ def _run(args: argparse.Namespace) -> int:
             def cancel_named_turn() -> None:
                 nonlocal cancellation_exit_code
                 try:
+                    # Reuse the exact launch prefix, including its target and cwd.
+                    base = commands[-1][0][:-5]
                     cancellation_exit_code, _ = _stream_command(
-                        base + ["cancel", "--session", args.session], "", child_env, 10, stdout, stderr)
+                        base + ["cancel", "--session", session], "", child_env, 10, stdout, stderr)
                 except OSError as exc:
                     cancellation_exit_code = 1
                     stderr.write((str(exc) + "\n").encode())
             try:
-                with _session_turn_lock(receipt_dir, target["argv"], cwd,
-                                        args.session if not control else None, started + timeout):
+                queue_timeout = request["queue_timeout_seconds"]
+                queued = session is not None and not control
+                phase = "queue" if queued else "setup"
+                set_phase("queued" if queued else "starting")
+                with _session_turn_lock(receipt_dir, request["target_argv"], Path(request["cwd"]),
+                                        session if queued else None,
+                                        started + queue_timeout if queue_timeout is not None else None,
+                                        is_cancelled):
+                    queue_wait = time.monotonic() - started if queued else 0.0
                     prompt_started = False
                     try:
                         for command, command_input in commands:
+                            if is_cancelled():
+                                raise KeyboardInterrupt
                             prompt_started = bool(command_input)
+                            phase = "execution" if prompt_started else "setup"
+                            if prompt_started:
+                                execution_started = time.monotonic()
+                            set_phase("running" if prompt_started else "starting")
                             return_code, interrupted = _stream_command(command, command_input, child_env,
-                                timeout + 30 - (time.monotonic() - started), stdout, stderr,
-                                cancel_named_turn if args.session and prompt_started and not control else None)
+                                timeout + 30, stdout, stderr,
+                                cancel_named_turn if session and prompt_started and not control else None,
+                                is_cancelled)
                             if return_code != 0 or interrupted:
                                 break
                     except KeyboardInterrupt:
                         return_code, interrupted = 130, "cancelled"
                     finally:
-                        if interrupted and args.session and prompt_started and not control and cancellation_exit_code is None:
+                        if interrupted and session and prompt_started and not control and cancellation_exit_code is None:
                             cancel_named_turn()
             except KeyboardInterrupt:
                 return_code, interrupted = 130, "cancelled"
@@ -568,8 +668,10 @@ def _run(args: argparse.Namespace) -> int:
                 return_code = 1
     finally:
         signal.signal(signal.SIGTERM, previous_handler)
+    if phase == "queue":
+        queue_wait = time.monotonic() - started
     with (receipt_dir / "events.ndjson").open(encoding="utf-8", errors="replace") as events:
-        parsed = _extract_result(events, max_result_chars)
+        parsed = _extract_result(events, launch["max_result_chars"])
     status = _result_status(return_code, parsed, interrupted, control)
     if cancellation_exit_code is not None and (
         cancellation_exit_code != 0 or parsed["stop_reason"] not in ("cancelled", "end_turn")
@@ -577,18 +679,107 @@ def _run(args: argparse.Namespace) -> int:
         status = "incomplete"
     result = {
         "schema": "agent-delegation-result/v1", **parsed, "status": status,
-        "delegation_id": delegation_id, "caller": caller, "target": args.to,
-        "chain": [*chain, args.to], "cwd": str(cwd), "exit_code": return_code,
-        "session_name": args.session, "requested_model": args.model, "operation": args.command,
+        **{key: request[key] for key in ("delegation_id", "caller", "target", "chain", "cwd",
+                                         "session_name", "requested_model", "operation")},
+        "exit_code": return_code, "terminal": True,
         "timeout_seconds": timeout, "cancellation_exit_code": cancellation_exit_code,
+        "queue_timeout_seconds": request["queue_timeout_seconds"],
+        "queue_wait_seconds": round(queue_wait, 3),
+        "execution_seconds": round(time.monotonic() - execution_started, 3) if execution_started is not None else 0,
+        "execution_started_at": state.get("execution_started_at"),
+        "timeout_phase": phase if status == "timeout" or interrupted == "timeout" else None,
         "launch_error": launch_error, "duration_seconds": round(time.monotonic() - started, 3),
         "receipt_dir": str(receipt_dir),
     }
     _atomic_write_json(receipt_dir / "result.json", result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    if status == "success":
+    return _result_exit_code(result)
+
+
+def _result_exit_code(result: dict[str, Any]) -> int:
+    if result["status"] == "success":
         return 0
-    return {"cancelled": 130, "timeout": 124, "denied": 5}.get(status, _normalized_exit_code(return_code) or 1)
+    return {"cancelled": 130, "timeout": 124, "denied": 5}.get(
+        result["status"], _normalized_exit_code(result.get("exit_code", 1)) or 1)
+
+
+def _task_receipt(task_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", task_id):
+        raise DelegationError("Task id must be the full delegation_id returned by run or submit.")
+    _, registry = _load_registry()
+    root = registry.get("receipt_root")
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise DelegationError("Registry receipt_root must be an absolute path.")
+    matches = list(Path(root).glob(f"*-{task_id}"))
+    if len(matches) != 1 or not (matches[0] / "request.json").is_file():
+        raise DelegationError(f"Task {task_id} not found in {root}.")
+    return matches[0]
+
+
+def _task_snapshot(receipt_dir: Path) -> dict[str, Any]:
+    result_path = receipt_dir / "result.json"
+    if result_path.exists():
+        return {**_read_json_object(result_path), "terminal": True}
+    state = _read_json_object(receipt_dir / "state.json")
+    with (receipt_dir / "worker.lock").open("rb") as owner:
+        try:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            alive = False
+        except BlockingIOError:
+            alive = True
+    # Completion can race a read of state or the ownership check.
+    if result_path.exists():
+        return {**_read_json_object(result_path), "terminal": True}
+    now = time.monotonic()
+    state["duration_seconds"] = round(now - state.pop("created_monotonic"), 3)
+    phase_started = state.pop("phase_started_monotonic", now)
+    if state["status"] == "queued":
+        state["queue_wait_seconds"] = state["duration_seconds"]
+    elif state["status"] == "running":
+        state["execution_seconds"] = round(now - phase_started, 3)
+    state["cancel_requested"] = (receipt_dir / "cancel.json").exists()
+    if not alive:
+        state.update(status="incomplete", terminal=True, execution_state="unknown",
+                     duration_seconds=None, queue_wait_seconds=None, execution_seconds=None,
+                     message="Worker exited without a terminal receipt; inspect events before retrying.")
+    return state
+
+
+def _observe_task(args: argparse.Namespace) -> int:
+    receipt_dir = _task_receipt(args.id)
+    if args.command == "cancel":
+        result = _task_snapshot(receipt_dir)
+        if args.dry_run:
+            result["dry_run"] = True
+        if not result["terminal"] and not args.dry_run:
+            _atomic_write_json(receipt_dir / "cancel.json", {
+                "delegation_id": args.id, "requested_at": datetime.now(UTC).isoformat()})
+            result = _task_snapshot(receipt_dir)
+    else:
+        if args.command == "wait" and args.timeout < 0:
+            raise DelegationError("Wait timeout must be non-negative seconds.")
+        deadline = time.monotonic() + (args.timeout if args.command == "wait" else 0)
+        while True:
+            result = _task_snapshot(receipt_dir)
+            if args.command != "wait" or result["terminal"]:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                result["wait_timed_out"] = True
+                break
+            time.sleep(min(0.1, remaining))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return _result_exit_code(result) if args.command == "wait" and result["terminal"] else 0
+
+
+def _cancel(args: argparse.Namespace) -> int:
+    if args.id:
+        if args.to or args.cwd or args.session:
+            raise DelegationError("Use --id alone, or --to/--cwd/--session for session-wide cancellation.")
+        return _observe_task(args)
+    if not all((args.to, args.cwd, args.session)):
+        raise DelegationError("Cancel requires --id, or all of --to, --cwd, and --session.")
+    return _run(args)
 
 
 def _list_targets(args: argparse.Namespace) -> int:
@@ -771,53 +962,66 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--to", help="Check only this target and its runtime dependencies.")
     doctor_parser.set_defaults(handler=_doctor)
 
-    run_parser = subparsers.add_parser("run", help="Run a delegated task, optionally in a named ACPX session.")
-    run_parser.add_argument("--to", required=True, help="Registered target name.")
-    run_parser.add_argument("--caller", help="Source label; defaults to the inherited caller or unknown.")
-    run_parser.add_argument("--chain", help="Comma-separated provenance chain; repeated targets are allowed.")
-    run_parser.add_argument("--max-depth", type=int, help="May lower the inherited/configured depth budget.")
-    run_parser.add_argument("--cwd", required=True, help="Existing absolute or resolvable task directory.")
-    task_group = run_parser.add_mutually_exclusive_group()
-    task_group.add_argument("--task", help="Short task text; prefer --task-file for long packets.")
-    task_group.add_argument("--task-file", help="UTF-8 mission envelope path, or pipe mission text on stdin.")
-    run_parser.add_argument("--timeout", type=int, help="Timeout in seconds, within the configured budget.")
-    run_parser.add_argument("--session", help="Ensure and continue a named native ACPX session.")
-    run_parser.add_argument("--model", help="Explicit target model; omitted to retain target defaults.")
-    run_parser.add_argument(
-        "--permissions",
-        choices=sorted(PERMISSION_FLAGS),
-        default="approve-all",
-        help="ACPX transport policy; defaults to preserving the target's normal capabilities.",
-    )
-    terminal_group = run_parser.add_mutually_exclusive_group()
-    terminal_group.add_argument(
-        "--terminal",
-        dest="terminal",
-        action="store_true",
-        help="Advertise ACP terminal capability (default).",
-    )
-    terminal_group.add_argument(
-        "--no-terminal",
-        dest="terminal",
-        action="store_false",
-        help="Explicitly remove ACP terminal capability for a restricted mission.",
-    )
-    run_parser.add_argument(
-        "--authorization-note",
-        help="Optional existing owner authority or prompt-boundary note stored in the receipt.",
-    )
-    run_parser.add_argument("--dry-run", action="store_true", help="Validate and print the launch plan only.")
-    run_parser.set_defaults(terminal=True, handler=_run)
+    for operation in ("run", "submit"):
+        run_parser = subparsers.add_parser(operation, help=("Run and wait for a delegated task." if operation == "run" else "Submit a task and return its ID without waiting for completion."))
+        run_parser.add_argument("--to", required=True, help="Registered target name.")
+        run_parser.add_argument("--caller", help="Source label; defaults to the inherited caller or unknown.")
+        run_parser.add_argument("--chain", help="Comma-separated provenance chain; repeated targets are allowed.")
+        run_parser.add_argument("--max-depth", type=int, help="May lower the inherited/configured depth budget.")
+        run_parser.add_argument("--cwd", required=True, help="Existing absolute or resolvable task directory.")
+        task_group = run_parser.add_mutually_exclusive_group()
+        task_group.add_argument("--task", help="Short task text; prefer --task-file for long packets.")
+        task_group.add_argument("--task-file", help="UTF-8 mission envelope path, or pipe mission text on stdin.")
+        run_parser.add_argument("--timeout", type=int, help="Execution budget in seconds, excluding queue wait and session setup.")
+        run_parser.add_argument("--queue-timeout", type=int, help="Optional queue wait limit in seconds; omitted to wait until admitted or cancelled.")
+        run_parser.add_argument("--session", help="Ensure and continue a named native ACPX session.")
+        run_parser.add_argument("--model", help="Explicit target model; omitted to retain target defaults.")
+        run_parser.add_argument(
+            "--permissions",
+            choices=sorted(PERMISSION_FLAGS),
+            default="approve-all",
+            help="ACPX transport policy; defaults to preserving the target's normal capabilities.",
+        )
+        terminal_group = run_parser.add_mutually_exclusive_group()
+        terminal_group.add_argument(
+            "--terminal",
+            dest="terminal",
+            action="store_true",
+            help="Advertise ACP terminal capability (default).",
+        )
+        terminal_group.add_argument(
+            "--no-terminal",
+            dest="terminal",
+            action="store_false",
+            help="Explicitly remove ACP terminal capability for a restricted mission.",
+        )
+        run_parser.add_argument(
+            "--authorization-note",
+            help="Optional existing owner authority or prompt-boundary note stored in the receipt.",
+        )
+        run_parser.add_argument("--dry-run", action="store_true", help="Validate and print the launch plan only.")
+        run_parser.set_defaults(terminal=True, handler=_run)
 
     for operation in ("cancel", "close"):
-        control = subparsers.add_parser(operation, help=f"{operation.capitalize()} a named native ACPX session.")
-        control.add_argument("--to", required=True)
-        control.add_argument("--cwd", required=True)
-        control.add_argument("--session", required=True)
-        control.add_argument("--timeout", type=int, default=30)
+        control = subparsers.add_parser(operation, help=("Cancel a task by ID or a named session's active turn."
+                                                        if operation == "cancel" else "Close a named native ACPX session."))
+        control.add_argument("--to", required=operation == "close")
+        control.add_argument("--cwd", required=operation == "close")
+        control.add_argument("--session", required=operation == "close")
+        if operation == "cancel":
+            control.add_argument("--id", help="Cancel only this delegation_id; safe for queued tasks.")
+        control.add_argument("--timeout", type=int, default=30, help="Timeout for native session control (default: 30).")
         control.add_argument("--dry-run", action="store_true")
-        control.set_defaults(handler=_run, caller=None, chain=None, max_depth=None,
+        control.set_defaults(handler=_cancel if operation == "cancel" else _run, caller=None, chain=None, max_depth=None,
                              model=None, permissions="approve-all", terminal=True, authorization_note=None)
+
+    for operation in ("status", "wait"):
+        observer = subparsers.add_parser(operation, help="Read task progress or result without owning its execution.")
+        observer.add_argument("--id", required=True, help="Full delegation_id returned by run or submit.")
+        if operation == "wait":
+            observer.add_argument("--timeout", type=int, default=30,
+                                  help="Seconds to wait for a result; expiration never cancels the task (default: 30).")
+        observer.set_defaults(handler=_observe_task)
 
     register_parser = subparsers.add_parser("register", help="Register an additional reviewed ACP target.")
     register_parser.add_argument("--name", required=True)
@@ -831,8 +1035,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    parser = _build_parser()
-    args = parser.parse_args()
+    if sys.argv[1:2] == ["_worker"]:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--receipt-dir", required=True)
+        parser.add_argument("--owner-fd", required=True, type=int)
+        parser.set_defaults(handler=_worker)
+        args = parser.parse_args(sys.argv[2:])
+    else:
+        parser = _build_parser()
+        args = parser.parse_args()
     try:
         return int(args.handler(args))
     except (DelegationError, OSError) as exc:

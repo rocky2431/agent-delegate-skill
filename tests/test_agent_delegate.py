@@ -497,6 +497,52 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertEqual(payload["limits"]["default_timeout_seconds"], 43200)
         self.assertTrue(any(c.get("warning") for c in payload["checks"]))
 
+    def test_submit_wait_timeout_does_not_end_execution(self) -> None:
+        self.acpx.write_text("#!/usr/bin/env python3\nimport json,sys,time\nsys.stdin.read()\n"
+            "print(json.dumps({'params':{'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'PARTIAL'}}}}),flush=True)\n"
+            "time.sleep(1.5)\nprint(json.dumps({'result':{'stopReason':'end_turn'}}))\n")
+        submitted = self.run_cli("submit", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture")
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        task = json.loads(submitted.stdout)
+        task_id = task["delegation_id"]
+        self.assertFalse(task["terminal"])
+        try:
+            waiting = self.run_cli("wait", "--id", task_id, "--timeout", "0")
+            snapshot = json.loads(waiting.stdout)
+            self.assertEqual(waiting.returncode, 0, waiting.stderr)
+            self.assertTrue(snapshot["wait_timed_out"])
+            self.assertFalse(snapshot["terminal"])
+            self.assertFalse(snapshot["cancel_requested"])
+            # Observation remains available even if launch configuration later changes.
+            self.target.unlink()
+            registry = json.loads(self.registry.read_text())
+            registry.update(max_delegation_depth=0, max_timeout_seconds=0)
+            self.registry.write_text(json.dumps(registry))
+            completed = self.run_cli("wait", "--id", task_id, "--timeout", "5")
+            result = json.loads(completed.stdout)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(result["terminal"])
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["assistant_text"], "PARTIAL")
+            self.assertGreater(result["execution_seconds"], 1)
+            self.assertEqual(result["queue_wait_seconds"], 0)
+            self.assertIsNone(result["timeout_phase"])
+            self.assertEqual(json.loads(self.run_cli("status", "--id", task_id).stdout), result)
+            self.assertFalse((Path(result["receipt_dir"]) / "launch.json").exists())
+        finally:
+            self.run_cli("cancel", "--id", task_id)
+            self.run_cli("wait", "--id", task_id, "--timeout", "5")
+
+    def test_task_control_rejects_ambiguous_identity_and_invalid_timeouts(self) -> None:
+        for arguments in (("status", "--id", "../anything"),
+                          ("cancel", "--id", "a" * 32, "--to", "beta")):
+            result = self.run_cli(*arguments)
+            self.assertEqual(result.returncode, 2)
+        for seconds in ("0", "-1"):
+            result = self.mission("--queue-timeout", seconds)
+            self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "receipts").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

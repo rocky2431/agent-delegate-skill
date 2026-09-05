@@ -9,27 +9,56 @@ Give the worker a mission, relevant context, existing authority, and a useful co
 
 Use `agent-delegate list --json` if targets are unknown. Choose a target for its useful context, tools, or independent perspective; the same agent type can run another independent task.
 
+## Submit and collect
+
+For ordinary delegation, submit once and keep the returned `delegation_id` with the task it identifies:
+
 ```bash
-agent-delegate run --to codex --caller hermes \
+agent-delegate submit --to codex \
   --cwd /absolute/task/root --task-file /absolute/mission.md
 ```
 
-The wrapper passes the registered executable argv directly to ACPX. It records provenance and applies the configured depth and time budgets. Agent names may repeat in the chain. Nested workers inherit caller/chain metadata; provide `--caller` or `--chain` when the host cannot preserve it.
-
-## Continue or cancel
-
-Use `--session <name>` when work needs follow-up. Repeat the same target, cwd, and session name to continue. Omit it for an independent one-shot task. Wrapper calls sharing a session wait their turn automatically; interrupting a waiting call does not cancel the active one.
+Then wait using that full ID. Replace `<delegation_id>` with the returned value:
 
 ```bash
-agent-delegate run --to codex --caller hermes --cwd /absolute/task/root \
-  --session review --task 'Investigate the issue and identify missing information.'
-agent-delegate run --to codex --caller hermes --cwd /absolute/task/root \
-  --session review --task 'Here is the requested detail. Continue the investigation.'
-agent-delegate cancel --to codex --cwd /absolute/task/root --session review
-agent-delegate close --to codex --cwd /absolute/task/root --session review
+agent-delegate wait --id <delegation_id> --timeout 30
 ```
 
-`--model` passes an explicitly chosen model to the target. Omit it to use the target's defaults; the caller's current model and conversation are not automatically inherited. Use [operations.md](references/operations.md) for receipts, configuration, and recovery. Native ACPX operations remain available when a needed capability is not exposed here; preserve the same target, task authority, and useful evidence.
+Read the JSON on every return; a successful command exit is not task completion.
+
+| Returned state | Next action |
+|---|---|
+| `terminal: false` (`starting`, `queued`, or `running`) | Keep this ID. Wait again, or do independent work and return to it. |
+| `wait_timed_out: true` | Only this observation ended; the task continues. Wait again on the same ID. Do not resubmit or cancel because a wait expired. |
+| `terminal: true`, `status: success` | Read `assistant_text` and `assistant_content`, integrate the result, and verify decision-critical claims proportionally. |
+| `terminal: true`, another status | Inspect the reason, partial output, and receipt before deciding how to recover. `incomplete` or `execution_state: unknown` needs inspection before retrying; the worker may have performed effects. |
+
+`execution_state: unknown` means the wrapper cannot establish the worker's outcome.
+A saved `queued` phase, zero execution time, or empty logs alone do not prove that
+work never started or has stopped. Report the outcome as unresolved unless native
+state or effects establish it; do not describe that delegated task as completed.
+For example, `{"terminal": true, "status": "incomplete", "execution_state": "unknown", "execution_seconds": null}`
+means: "The wrapper ended without a final result; native execution remains unknown.
+Inspect native state and effects before retrying." Here `terminal` ends wrapper
+observation; it does not establish that the native task stopped.
+
+`status --id <delegation_id>` reads progress immediately and retrieves the same full result after completion. If a submit response is lost, recover the ID from its stderr receipt or saved request before submitting again. If the host interrupts a `wait`, resume observation with the same ID; the submitted task runs independently of that observer.
+
+The timeouts have different meanings: `wait --timeout` limits one observation; `submit --timeout` limits execution, excluding queue wait and session setup. Omit the execution override to use the configured budget. Add `--queue-timeout` only when the task needs a queue deadline; by default it waits for admission or cancellation.
+
+## Follow up or cancel when needed
+
+A delegation ID identifies one submitted task. A session name carries conversation context across tasks. Omit `--session` for independent work, even when several tasks go to the same target. To continue a conversation, submit a new follow-up with the same target, cwd, and `--session <name>` used for the first task. Wrapper turns sharing that session wait automatically; separate sessions or one-shot tasks can run independently.
+
+When a specific task should stop, cancel its ID and then observe that ID until the outcome is known:
+
+```bash
+agent-delegate cancel --id <delegation_id>
+```
+
+A cancellation acknowledgement is not proof that work stopped. Use task-ID cancellation for a queued task; session-wide cancellation targets the session's active turn. Cancellation and session closure are conditional controls, not routine result-collection steps. See [operations.md](references/operations.md) for synchronous `run`, session controls, receipts, and recovery.
+
+The worker does not automatically inherit the caller's conversation or model. Pass the context it needs; use `--model` only for an explicit model choice, otherwise retain the target's defaults. The wrapper launches the registered argv and records provenance. Agent names may repeat in the chain. Nested workers inherit caller/chain metadata. When metadata is absent, set `--caller` to your actual host label if known; otherwise retain `unknown`. Supply `--chain` only from known provenance.
 
 ## Authority and capabilities
 

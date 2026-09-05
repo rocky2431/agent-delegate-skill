@@ -43,8 +43,9 @@ def serve_fixture() -> None:
         if marker == "crash":
             os._exit(8)
         stop = "max_tokens" if marker == "partial" else "end_turn"
-        if marker == "wait":
-            stop = "cancelled" if cancelled.wait(30) else "end_turn"
+        if marker == "wait" or marker.startswith("delay:"):
+            duration = 30 if marker == "wait" else float(marker.split(":", 1)[1])
+            stop = "cancelled" if cancelled.wait(duration) else "end_turn"
             (state / (session + ".finished")).write_text(stop)
         if marker == "brief":
             time.sleep(2)
@@ -55,6 +56,7 @@ def serve_fixture() -> None:
         method = request.get("method")
         result: dict = {}
         if method == "initialize":
+            time.sleep(float(os.environ.get("DELEGATION_FIXTURE_STARTUP_DELAY", "0")))
             result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True},
                       "authMethods": [], "agentInfo": {"name": "transport-fixture", "version": "1"}}
         elif method == "session/new":
@@ -97,19 +99,24 @@ class NativeTransportTests(unittest.TestCase):
                        DELEGATION_FIXTURE_STATE=str(root / "state"),
                        NODE_OPTIONS="--require " + str(preload))
 
-            def command(case: str = "", session: str | None = None, operation: str = "run") -> list[str]:
+            def command(case: str = "", session: str | None = None, operation: str = "run",
+                        timeout: int | None = None, queue_timeout: int | None = None) -> list[str]:
                 args = [sys.executable, str(SCRIPT), operation, "--to", "fixture", "--cwd", str(root / "task")]
-                if operation == "run":
+                if operation in ("run", "submit"):
                     args += ["--caller", "fixture", "--task", "CASE:" + case]
                 if session:
                     args += ["--session", session]
+                if timeout is not None:
+                    args += ["--timeout", str(timeout)]
+                if queue_timeout is not None:
+                    args += ["--queue-timeout", str(queue_timeout)]
                 return args
 
             def start(*args: str, **kwargs: str) -> subprocess.Popen:
                 return subprocess.Popen(command(*args, **kwargs), env=env, text=True,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            def finish(process: subprocess.Popen) -> dict:
+            def finish(process: subprocess.Popen, observation: bool = False) -> dict:
                 try:
                     stdout, stderr = process.communicate(timeout=45)
                 except BaseException:
@@ -117,11 +124,12 @@ class NativeTransportTests(unittest.TestCase):
                     process.communicate()
                     raise
                 payload = json.loads(stdout)
-                self.assertEqual(process.returncode == 0, payload["status"] == "success", stderr)
+                self.assertEqual(process.returncode == 0,
+                                 observation or payload["status"] == "success" or not payload.get("terminal", True), stderr)
                 return payload
 
             def run(*args: str, **kwargs: str) -> dict:
-                return finish(start(*args, **kwargs))
+                return finish(start(*args, **kwargs), observation=kwargs.get("operation") == "submit")
 
             def wait_for_event(marker: str) -> None:
                 deadline = time.monotonic() + 10
@@ -146,6 +154,31 @@ class NativeTransportTests(unittest.TestCase):
 
             waiting = None
             queued = None
+            submitted_ids = []
+            observer = None
+
+            def submit(*args, **kwargs) -> dict:
+                result = run(*args, operation="submit", **kwargs)
+                submitted_ids.append(result["delegation_id"])
+                return result
+
+            def task_control(operation: str, task: dict, timeout: int = 0) -> dict:
+                args = [sys.executable, str(SCRIPT), operation, "--id", task["delegation_id"]]
+                if operation == "wait":
+                    args += ["--timeout", str(timeout)]
+                return finish(subprocess.Popen(args, env=env, text=True,
+                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+                              observation=operation != "wait")
+
+            def wait_for_phase(task: dict, phase: str) -> dict:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    result = task_control("status", task)
+                    if result["status"] == phase:
+                        return result
+                    time.sleep(0.05)
+                self.fail("Task did not reach phase " + phase + ": " + str(result))
+
             try:
                 first, second = [finish(process) for process in [start("fresh"), start("fresh")]]
                 self.assertEqual(first["assistant_text"], "fresh:turn=1")
@@ -189,7 +222,95 @@ class NativeTransportTests(unittest.TestCase):
                 crashed = run("crash")
                 self.assertNotEqual(crashed["status"], "success")
                 self.assertEqual(crashed["assistant_text"], "crash:turn=1")
+
+                active = submit("wait", session="jobs")
+                wait_for_event("wait:turn=1")
+                snapshot = task_control("wait", active, 1)
+                self.assertTrue(snapshot["wait_timed_out"])
+                self.assertFalse(snapshot["terminal"])
+                observer = subprocess.Popen([sys.executable, str(SCRIPT), "wait", "--id",
+                    active["delegation_id"], "--timeout", "60"], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                time.sleep(0.2)
+                self.assertIsNone(observer.poll())
+                observer.send_signal(signal.SIGTERM)
+                observer.communicate(timeout=5)
+                self.assertEqual(task_control("status", active)["status"], "running")
+
+                abandoned = submit("must-not-run", session="jobs")
+                wait_for_phase(abandoned, "queued")
+                task_control("cancel", abandoned)
+                result = task_control("wait", abandoned, 10)
+                self.assertEqual(result["status"], "cancelled")
+                self.assertEqual(result["assistant_text"], "")
+                self.assertEqual(result["execution_seconds"], 0)
+                self.assertIsNone(result["cancellation_exit_code"])
+
+                expired = submit("must-not-run", session="jobs", queue_timeout=1)
+                result = task_control("wait", expired, 10)
+                self.assertEqual(result["status"], "timeout")
+                self.assertEqual(result["timeout_phase"], "queue")
+                self.assertEqual(result["execution_seconds"], 0)
+                self.assertIsNone(result["cancellation_exit_code"])
+
+                lost = submit("must-not-run", session="jobs")
+                lost_state = wait_for_phase(lost, "queued")
+                os.kill(lost_state["worker_pid"], signal.SIGKILL)
+                result = task_control("wait", lost, 5)
+                self.assertEqual(result["status"], "incomplete")
+                self.assertEqual(result["execution_state"], "unknown")
+                for field in ("duration_seconds", "queue_wait_seconds", "execution_seconds"):
+                    self.assertIsNone(result[field])
+                self.assertEqual(task_control("status", active)["status"], "running")
+
+                task_control("cancel", active)
+                result = task_control("wait", active, 10)
+                self.assertEqual(result["status"], "cancelled")
+                self.assertEqual(result["stop_reason"], "cancelled")
+                self.assertEqual(result["cancellation_exit_code"], 0)
+                self.assertEqual(result["assistant_text"], "wait:turn=1")
+                continued = submit("brief", session="jobs")
+                wait_for_event("brief:turn=2")
+                task_control("cancel", active)
+                self.assertEqual(task_control("wait", continued, 10)["status"], "success")
+
+                first = submit("delay:5", session="budget")
+                wait_for_event("delay:5:turn=1")
+                second = submit("brief", session="budget", timeout=3)
+                wait_for_phase(second, "queued")
+                self.assertEqual(task_control("wait", first, 10)["status"], "success")
+                result = task_control("wait", second, 10)
+                self.assertEqual(result["status"], "success")
+                self.assertGreater(result["queue_wait_seconds"], result["timeout_seconds"])
+                self.assertGreaterEqual(result["execution_seconds"], 2)
+                self.assertIsNone(result["timeout_phase"])
+
+                env["DELEGATION_FIXTURE_STARTUP_DELAY"] = "2"
+                try:
+                    early = submit("wait", session="startup")
+                finally:
+                    env.pop("DELEGATION_FIXTURE_STARTUP_DELAY")
+                wait_for_phase(early, "running")
+                task_control("cancel", early)
+                result = task_control("wait", early, 15)
+                self.assertEqual(result["status"], "cancelled")
+                self.assertEqual(result["stop_reason"], "cancelled")
+                self.assertEqual(result["cancellation_exit_code"], 0)
+                timed_out = run("wait", timeout=2)
+                self.assertEqual(timed_out["status"], "timeout")
+                self.assertEqual(timed_out["timeout_phase"], "execution")
+                self.assertEqual(timed_out["assistant_text"], "wait:turn=1")
             finally:
+                if observer is not None and observer.poll() is None:
+                    observer.send_signal(signal.SIGTERM)
+                    observer.communicate(timeout=5)
+                for task_id in submitted_ids:
+                    with self.subTest(cleanup_task=task_id):
+                        task_control("cancel", {"delegation_id": task_id})
+                        task_control("wait", {"delegation_id": task_id}, 15)
+                for session in ("jobs", "budget", "startup"):
+                    with self.subTest(close_session=session):
+                        run(operation="close", session=session)
                 if queued is not None and queued.poll() is None:
                     queued.send_signal(signal.SIGTERM)
                     finish(queued)
