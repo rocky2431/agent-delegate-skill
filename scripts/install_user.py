@@ -17,7 +17,7 @@ import tempfile
 from typing import Any
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +50,7 @@ def _skill_destination(home: Path, host: str) -> Path:
         "hermes": home / ".hermes" / "skills",
         "claude": home / ".claude" / "skills",
         "codex": home / ".agents" / "skills",
-        "kimi": home / ".kimi" / "skills",
+        "kimi": Path(os.environ.get("KIMI_CODE_HOME") or home / ".kimi-code").expanduser() / "skills",
         "zcode": home / ".zcode" / "skills",
         "opencode": home / ".config" / "opencode" / "skills",
     }

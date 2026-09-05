@@ -57,7 +57,7 @@ class InstallerTests(unittest.TestCase):
             "hermes": home / ".hermes/skills/agent-delegation",
             "claude": home / ".claude/skills/agent-delegation",
             "codex": home / ".agents/skills/agent-delegation",
-            "kimi": home / ".kimi/skills/agent-delegation",
+            "kimi": home / ".kimi-code/skills/agent-delegation",
             "zcode": home / ".zcode/skills/agent-delegation",
             "opencode": home / ".config/opencode/skills/agent-delegation",
         }
@@ -129,6 +129,19 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(registry["max_timeout_seconds"], 43200)
             self.assertEqual(acpx["defaultPermissions"], "approve-all")
             self.assertEqual(acpx["timeout"], 7200)
+
+
+class KimiHomeTests(unittest.TestCase):
+    def test_native_default_and_custom_kimi_home(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            with patch.dict(install_user.os.environ, {"KIMI_CODE_HOME": ""}):
+                self.assertEqual(install_user._skill_destination(home, "kimi"),
+                                 home / ".kimi-code/skills/agent-delegation")
+            custom = home / "custom kimi home"
+            with patch.dict(install_user.os.environ, {"KIMI_CODE_HOME": str(custom)}):
+                self.assertEqual(install_user._skill_destination(home, "kimi"),
+                                 custom / "skills/agent-delegation")
 
 
 if __name__ == "__main__":

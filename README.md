@@ -59,7 +59,7 @@ Skill locations:
 - Hermes: `~/.hermes/skills/agent-delegation`
 - Claude Code: `~/.claude/skills/agent-delegation`
 - Codex portable discovery: `~/.agents/skills/agent-delegation`
-- Kimi: `~/.kimi/skills/agent-delegation`
+- Kimi: `~/.kimi-code/skills/agent-delegation`（设置 `KIMI_CODE_HOME` 时使用该目录下的 `skills`）
 - zCode: `~/.zcode/skills/agent-delegation`
 - OpenCode: `~/.config/opencode/skills/agent-delegation`
 
@@ -190,3 +190,5 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_
 AGENT_DELEGATION_TEST_ACPX=/absolute/path/to/runtime/node_modules/.bin/acpx \
   python3 -m unittest discover -s tests -p test_acpx_transport.py -v
 ```
+
+Kimi 安装路径按原生 Kimi Code 0.41.0 核对；旧 Python `kimi-cli` 的 `~/.kimi` 目录不由此安装器迁移或删除。委派使用 `kimi acp`，本 Skill 不安装恢复 Hook。模型 API 兼容不代表客户端 Hook 行为相同。参见 [Kimi Skill 目录](https://www.kimi.com/code/docs/kimi-code-cli/customization/skills.html)。
