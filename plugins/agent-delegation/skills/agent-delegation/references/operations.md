@@ -7,11 +7,18 @@ plugin; other hosts use their user Skill directories. `agent-delegate` runs the
 canonical copy under `~/.local/share/agent-delegation/skill`.
 
 The wrapper registry is `~/.config/agent-delegation/config.json`. Its `targets`
-entries are the launch source: the wrapper passes that exact argv to ACPX without
-a shell, so a project `.acpxrc.json` agent alias cannot select another executable.
+entries are the launch source: custom targets pass their exact argv to ACPX without
+a shell. Managed targets use a stable `launch_argv` entry that executes a snapshot
+of the registered `argv`. A project `.acpxrc.json` agent alias cannot select another executable.
 ACPX still loads its native model, authentication, MCP, and other configuration.
 The installer also maintains aliases in `~/.acpx/config.json` for direct operator
 use; these aliases are not a second startup gate for the wrapper.
+
+Codex binds `CODEX_PATH`; Claude binds `CLAUDE_CODE_EXECUTABLE`. Each points to the
+stable local CLI entry, rather than the adapter's bundled CLI. At adapter startup
+the launcher resolves that entry once, probes the selected executable, and passes
+its resolved path to the adapter. Missing executables and compatibility errors
+are surfaced; there is no bundled-CLI fallback or dependency download per task.
 
 Fresh installations default to 7200 seconds and depth 4. Existing registry values
 are preserved, including longer owner-configured budgets. `--timeout` must fit the
@@ -56,11 +63,18 @@ is specifically useful and the host can keep that process alive. Interrupting
 ## Sessions and cancellation
 
 `submit --session <name>` (also `run`) ensures a native ACPX session and sends a
-prompt. Reuse the same target argv, cwd, and name for continuation. Wrapper calls
+prompt. Reuse the same target, cwd, and name for continuation. Wrapper calls
 sharing these values and the receipt root wait their turn before submitting to
 ACPX. Queue wait does not consume execution budget. Different sessions, or calls
 without `--session`, are independent; the target's own capacity still applies.
 The target must implement the ACP capabilities needed for its session lifecycle.
+
+The managed launch command stays stable across runtime upgrades. An existing warm
+ACPX owner keeps its original adapter and CLI process; its startup identity stays
+in subsequent receipts. The next newly started adapter uses the selected runtime
+and current local CLI. Pre-launcher named sessions are discovered through ACPX's
+local index and continue under their original command. They remain in the old
+runtime until closed; their CLI identity is unverified without a startup record.
 
 For one task, including a queued task, use:
 
@@ -75,6 +89,14 @@ ownership is lost, the snapshot reports `incomplete` with
 events, partial output, and the native session before retrying a task with effects.
 Elapsed timing fields are `null` when wrapper ownership is lost, because neither
 the final duration nor time spent in each phase can be established.
+
+Native cancellation interrupts a model turn; it does not guarantee that every
+spawned terminal command has stopped. In the Codex 0.153.4 / codex-acp 1.10.0 live
+check, `stopReason: cancelled` arrived while a previously started terminal sleep
+still ran. Both Codex and Claude confirmed turn cancellation; that alone does not
+establish terminal cleanup. Inspect native terminal/job state when cleanup matters, and stop the specific job using
+the target's controls. The wrapper does not kill an entire warm session or guess
+which unrelated/background processes should be terminated.
 
 Only when intentionally stopping a named session's active turn, use:
 
@@ -107,7 +129,11 @@ Each `run`, `submit`, or native session control creates a private directory unde
   `launch.json` holds the launch plan, including the mission, until the worker
   consumes and removes it; inherited environment secrets are not serialized.
 - `result.json`: terminal state, text, original content blocks, session ids,
-  structured RPC/tool errors, and receipt location.
+  structured RPC/tool errors, runtime identity, and receipt location.
+- `runtime.json`: CLI path/version, adapter path/version, ACPX path/version, and
+  adapter launch PID/time. Named sessions reuse the startup record under
+  `.session-locks/`; the final receipt gets its own copy. `observation` distinguishes
+  `adapter_launch`, `legacy_session_unverified`, and `launch_unobserved`.
 
 Task-ID `status`, `wait`, and `cancel` reuse this receipt instead of creating new
 tasks. Cancellation writes a task-specific request for the owning wrapper; it does
@@ -138,10 +164,12 @@ an adapter cannot supply enough information to classify an event.
 agent-delegate doctor --to codex --json
 ```
 
-Doctor reports the effective registry budgets and launch argv. Version probes are
-informational: a stale standalone CLI path does not prove that an adapter fails,
-and an adapter may bundle a different CLI. Fix the failing target or configuration
-layer. Do not treat an unrelated target warning as a global startup prohibition.
+Doctor reports effective budgets and separates the configured CLI, adapter, and
+ACPX identities in `runtimes`. This is the selection for a new process, not proof
+that a warm session has upgraded. Read its receipt for the observed startup.
+Version drift and unavailable version probes are informational. A missing bound
+CLI or adapter is an actionable failure; fix that target or configuration layer.
+Do not treat an unrelated target warning as a global startup prohibition.
 
 Repair authentication directly through the provider. The managed ZCode adapter's
 `--no-browser` avoids unattended OAuth/device login; it does not disable ordinary
@@ -155,6 +183,27 @@ configures only Kimi's target. Use `--targets` to select ACP targets separately
 from Skill hosts; `--hosts none --targets none` installs only the shared runtime.
 Existing unselected targets and custom budgets are preserved. Replacing an
 unmanaged Skill or executable remains an explicit operation.
+
+Ordinary `python3 scripts/install_user.py install` preserves an existing runtime,
+including its lockfile. It does not run npm against it. The first installation,
+or the following explicit upgrade, installs current stable releases:
+
+```bash
+python3 scripts/install_user.py install --update-runtime
+```
+
+The installer uses `npm install --save-exact --ignore-scripts` in a new directory
+under `~/.local/share/agent-delegation/runtimes/`. It records installed versions and
+the lock hash before updating the registry and command links. Failed installation
+leaves the previous runtime selected. Old directories are retained for active
+processes, legacy sessions, and rollback. An explicit runtime upgrade also refreshes
+previously managed Codex/Claude adapter targets even if those Skill hosts are not
+selected. Custom targets remain unchanged.
+
+The repository's `runtime/package-lock.json` is a reproducible development/test
+snapshot, not an installer version policy. To roll back, restore the backed-up
+registry and ACPX configuration and repoint the `acpx` command to that registry's
+`acpx_path`. Retain any runtime directories still needed by active tasks or sessions.
 
 Register an already installed ACP executable when the owner requests a new target:
 

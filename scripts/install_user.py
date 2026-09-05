@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the pinned agent-delegation runtime and Skill at user scope."""
+"""Install the agent-delegation Skill; explicitly upgrade its shared runtime."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import tempfile
 from typing import Any
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,13 +28,8 @@ SKILL_SOURCE = (
     / "skills"
     / "agent-delegation"
 )
-RUNTIME_SOURCE = REPO_ROOT / "runtime"
 HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode")
-RUNTIME_PACKAGES = {
-    "acpx": "0.13.2",
-    "@agentclientprotocol/claude-agent-acp": "0.70.0",
-    "@agentclientprotocol/codex-acp": "1.7.0",
-}
+RUNTIME_PACKAGES = ("acpx", "@agentclientprotocol/claude-agent-acp", "@agentclientprotocol/codex-acp")
 LEGACY_DEFAULT_CHAR_LIMITS = {
     "max_task_chars": 200000,
     "max_result_chars": 20000,
@@ -227,30 +222,40 @@ def _version_line(argv: list[str]) -> str:
     return lines[0]
 
 
-def _install_runtime(home: Path, backup: Path, replace_existing: bool) -> tuple[Path, Path]:
+def _runtime_versions(runtime_root: Path) -> dict[str, str]:
+    versions = {}
+    for name in RUNTIME_PACKAGES:
+        version = _read_json_object(runtime_root / "node_modules" / name / "package.json").get("version")
+        if not isinstance(version, str) or not version:
+            raise InstallError(f"Missing runtime package {name} in {runtime_root}; use install --update-runtime")
+        versions[name] = version
+    return versions
+
+
+def _install_runtime(home: Path, backup: Path, replace_existing: bool,
+                     update_runtime: bool = False) -> tuple[Path, Path]:
     share_root = home / ".local" / "share" / "agent-delegation"
     marker_path = share_root / ".managed.json"
     if share_root.exists() and not marker_path.exists() and not replace_existing:
         raise InstallError(
             f"Refusing to replace unmanaged runtime root {share_root}; use --replace-existing after review."
         )
-    runtime_root = share_root / "runtime"
+    registry = _read_json_object(home / ".config/agent-delegation/config.json")
+    existing_root = Path(registry.get("runtime_root", share_root / "runtime"))
+    if existing_root.is_dir() and not update_runtime:
+        # Skill updates never run npm against an existing runtime, even when it is
+        # incomplete. An explicit update stages a replacement without touching it.
+        return share_root, existing_root
     for name in ("package.json", "package-lock.json"):
-        existing = runtime_root / name
+        existing = existing_root / name
         if existing.exists():
             _backup_item(existing, backup / "runtime" / name)
-    runtime_root.mkdir(parents=True, exist_ok=True)
-    for name in ("package.json", "package-lock.json"):
-        source = RUNTIME_SOURCE / name
-        if not source.is_file():
-            raise InstallError(f"Missing reviewed runtime file {source}.")
-        _atomic_write_text(runtime_root / name, source.read_text(encoding="utf-8"), 0o644)
     npm = shutil.which("npm")
     if not npm:
-        raise InstallError("npm is required to install the pinned ACPX runtime.")
+        raise InstallError("npm is required to install or update the ACPX runtime.")
     node = shutil.which("node")
     if not node:
-        raise InstallError("Node.js is required to install the pinned ACPX runtime.")
+        raise InstallError("Node.js is required to install or update the ACPX runtime.")
     node_version = _version_line([node, "--version"])
     try:
         node_parts = [int(part) for part in node_version.lstrip("v").split(".")[:2]]
@@ -258,23 +263,36 @@ def _install_runtime(home: Path, backup: Path, replace_existing: bool) -> tuple[
     except (IndexError, ValueError) as exc:
         raise InstallError(f"Cannot parse Node.js version {node_version!r}.") from exc
     if node_major < 22 or (node_major == 22 and node_minor < 13):
-        raise InstallError(f"ACPX 0.13.2 requires Node.js >=22.13; observed {node_version}.")
-    completed = subprocess.run(
-        [npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
-        cwd=runtime_root,
-        text=True,
-        capture_output=True,
-        timeout=300,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise InstallError(f"Pinned runtime npm ci failed:\n{completed.stderr[-4000:]}")
+        raise InstallError(f"The runtime requires Node.js >=22.13; observed {node_version}.")
+    generations = share_root / "runtimes"
+    generations.mkdir(parents=True, exist_ok=True)
+    runtime_root = Path(tempfile.mkdtemp(prefix=datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-"), dir=generations))
+    try:
+        _atomic_write_json(runtime_root / "package.json", {
+            "name": "agent-delegation-runtime", "version": VERSION, "private": True,
+        }, 0o644)
+        completed = subprocess.run(
+            [npm, "install", "--save-exact", "--ignore-scripts", "--no-audit", "--no-fund",
+             *[name + "@latest" for name in RUNTIME_PACKAGES]],
+            cwd=runtime_root, text=True, capture_output=True, timeout=300, check=False,
+        )
+        if completed.returncode != 0:
+            raise InstallError(f"Runtime update failed; the previous runtime is unchanged:\n{completed.stderr[-4000:]}")
+        versions = _runtime_versions(runtime_root)
+        _version_line([str(runtime_root / "node_modules/.bin/acpx"), "--version"])
+        _atomic_write_json(runtime_root / ".agent-delegation-managed.json", {
+            "package": "agent-delegation", "installed_at": datetime.now(UTC).isoformat(),
+            "runtime_packages": versions,
+            "runtime_lock_sha256": _sha256(runtime_root / "package-lock.json"),
+        })
+    except BaseException:
+        shutil.rmtree(runtime_root)
+        raise
     _atomic_write_json(
         marker_path,
         {
             "package": "agent-delegation",
             "version": VERSION,
-            "runtime_lock_sha256": _sha256(runtime_root / "package-lock.json"),
         },
     )
     return share_root, runtime_root
@@ -296,9 +314,9 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
             package = "claude-agent-acp" if name == "claude" else "codex-acp"
             adapter = (runtime_root / "node_modules/.bin" / package).resolve()
             if not adapter.is_file() or not os.access(adapter, os.X_OK):
-                raise InstallError(f"Pinned ACP adapter is missing or not executable: {adapter}")
+                raise InstallError(f"ACP adapter is missing or not executable: {adapter}; use install --update-runtime")
             argv = [str(adapter)]
-            provenance = f"@agentclientprotocol/{package}@{RUNTIME_PACKAGES['@agentclientprotocol/' + package]}"
+            provenance = f"@agentclientprotocol/{package} with the local {name} CLI"
         elif name == "zcode":
             bundle = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
             if not bundle.is_file():
@@ -309,7 +327,19 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
                     "--prompt-timeout-secs", str(registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS)), "--no-browser"]
         targets[name] = {"argv": argv, "version_argv": [str(executable), "--version"],
                          "observed_version": _version_line([str(executable), "--version"]),
-                         "provenance": provenance}
+                         "provenance": provenance,
+                         "launch_argv": [str(home / ".local/share/agent-delegation/skill/scripts/agent_delegate.py"),
+                                         "_launch", "--to", name]}
+        if name in ("claude", "codex"):
+            targets[name].update(
+                cli_env={"CLAUDE_CODE_EXECUTABLE" if name == "claude" else "CODEX_PATH": str(executable)},
+                adapter_package="@agentclientprotocol/" + package,
+            )
+        elif name == "zcode":
+            targets[name]["version_argv"] = [str(node), str(bundle), "--version"]
+            targets[name]["cli_path"] = str(bundle)
+            targets[name]["observed_version"] = _version_line(targets[name]["version_argv"])
+            targets[name]["adapter_version_argv"] = [str(executable), "--version"]
     return targets
 
 
@@ -328,18 +358,26 @@ def _merge_registry(
     if existing_targets is not None and not isinstance(existing_targets, dict):
         raise InstallError("Existing delegation targets must be a JSON object.")
     targets = {**(existing_targets or {}), **managed_targets}
+    for name, target in managed_targets.items():
+        previous = (existing_targets or {}).get(name, {})
+        if target.get("launch_argv") and previous.get("argv"):
+            # Old named sessions retain their native command scope. New sessions
+            # use a stable launcher whose command survives later runtime upgrades.
+            target["legacy_argv"] = previous.get("legacy_argv", [])
+            if not previous.get("launch_argv") and previous["argv"] not in target["legacy_argv"]:
+                target["legacy_argv"] = [*target["legacy_argv"], previous["argv"]]
     registry.update(
         {
             "schema_version": 1,
             "acpx_path": str((runtime_root / "node_modules" / ".bin" / "acpx").resolve()),
             "acpx_config_path": str(acpx_path),
             "runtime_root": str(runtime_root),
-            "runtime_packages": RUNTIME_PACKAGES,
+            "runtime_packages": _runtime_versions(runtime_root),
             "runtime_lock_sha256": _sha256(runtime_root / "package-lock.json"),
-            "receipt_root": str(home / ".local" / "state" / "agent-delegation" / "runs"),
             "targets": targets,
         }
     )
+    registry.setdefault("receipt_root", str(home / ".local/state/agent-delegation/runs"))
     registry.setdefault("default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     registry.setdefault("max_timeout_seconds", MAX_TIMEOUT_SECONDS)
     registry.setdefault("max_delegation_depth", 4)
@@ -356,7 +394,7 @@ def _merge_registry(
                 raise InstallError(f"Delegation target {name!r} has invalid argv.")
             continue
         if name in managed_targets:
-            agents[name] = {"argv": argv}
+            agents[name] = {"argv": record.get("launch_argv", argv)}
         else:
             agents.setdefault(name, {"argv": argv})
     acpx.setdefault("defaultPermissions", "approve-all")
@@ -395,7 +433,17 @@ def _install(args: argparse.Namespace) -> int:
     if not SKILL_SOURCE.is_dir():
         raise InstallError(f"Missing Skill source {SKILL_SOURCE}.")
     backup = _new_backup_dir(home, "install")
-    share_root, runtime_root = _install_runtime(home, backup, args.replace_existing)
+    share_root, runtime_root = _install_runtime(home, backup, args.replace_existing, args.update_runtime)
+    # A runtime upgrade refreshes already managed adapter targets even when the
+    # selected Skill hosts exclude them; custom registrations are left alone.
+    if args.update_runtime:
+        existing_targets = _read_json_object(home / ".config/agent-delegation/config.json").get("targets", {})
+        for name in ("claude", "codex"):
+            previous = existing_targets.get(name, {})
+            if name not in target_names and (previous.get("adapter_package") or
+                    str(previous.get("provenance", "")).startswith("@agentclientprotocol/")):
+                target_names.append(name)
+    targets = _build_managed_targets(home, runtime_root, target_names)
     canonical_skill = share_root / "skill"
     _copy_skill(canonical_skill, backup, "canonical", args.replace_existing)
     for host in hosts:
@@ -405,7 +453,6 @@ def _install(args: argparse.Namespace) -> int:
             host,
             args.replace_existing,
         )
-    targets = _build_managed_targets(home, runtime_root, target_names)
     registry_path, registry, acpx_config = _merge_registry(
         home, runtime_root, targets, backup
     )
@@ -431,6 +478,8 @@ def _install(args: argparse.Namespace) -> int:
         "registry": str(registry_path),
         "acpx_config": str(acpx_config),
         "runtime_root": str(runtime_root),
+        "runtime_updated": args.update_runtime,
+        "runtime_packages": registry["runtime_packages"],
         "runtime_lock_sha256": registry["runtime_lock_sha256"],
         "targets": sorted(targets),
     }
@@ -466,7 +515,7 @@ def _uninstall(args: argparse.Namespace) -> int:
     registered_targets = registry.get("targets") or {}
     if not isinstance(registered_targets, dict):
         raise InstallError("Existing delegation targets must be a JSON object.")
-    custom_targets = sorted(set(registered_targets) - MANAGED_TARGETS)
+    custom_targets = sorted(set(registered_targets) - set(HOSTS))
     if args.remove_runtime and custom_targets:
         raise InstallError(
             "Refusing to remove the shared runtime while custom targets remain: "
@@ -488,9 +537,9 @@ def _uninstall(args: argparse.Namespace) -> int:
         agents = acpx_config.get("agents") or {}
         if not isinstance(agents, dict):
             raise InstallError("Existing ACPX agents must be a JSON object.")
-        for name in MANAGED_TARGETS:
+        for name in HOSTS:
             record = registered_targets.get(name)
-            expected = {"argv": record.get("argv")} if isinstance(record, dict) else None
+            expected = {"argv": record.get("launch_argv", record.get("argv"))} if isinstance(record, dict) else None
             if expected is not None and agents.get(name) == expected:
                 agents.pop(name, None)
         if agents:
@@ -537,6 +586,8 @@ def _build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--hosts", default=",".join(HOSTS))
     install_parser.add_argument("--targets", help="ACP targets to configure; defaults to selected hosts. Use none for runtime/Skill only.")
     install_parser.add_argument("--replace-existing", action="store_true")
+    install_parser.add_argument("--update-runtime", action="store_true",
+                                help="Install current stable npm releases in a new directory; retain the old runtime.")
     install_parser.set_defaults(handler=_install)
 
     doctor_parser = subparsers.add_parser("doctor")

@@ -8,7 +8,7 @@
 Any host CLI
   -> portable agent-delegation Skill
   -> deterministic agent-delegate boundary
-  -> pinned ACPX transport
+  -> installed ACPX transport
   -> reviewed target ACP server
 ```
 
@@ -25,23 +25,23 @@ Skill 说明任务语义；wrapper 负责来源、预算和结果；会话生命
 | Target | Reviewed ACP argv source |
 |---|---|
 | Hermes | Existing `hermes acp` |
-| Claude Code | `@agentclientprotocol/claude-agent-acp@0.70.0` |
-| Codex | `@agentclientprotocol/codex-acp@1.7.0` |
+| Claude Code | Installed `claude-agent-acp` + local `claude` via `CLAUDE_CODE_EXECUTABLE` |
+| Codex | Installed `codex-acp` + local `codex` via `CODEX_PATH` |
 | Kimi | Existing `kimi acp` |
 | zCode | Existing Ultra-pinned `zcode-acp` bridge |
 | OpenCode | Existing `opencode acp` |
 
 Managed targets keep their normal tools and plugin surfaces. ZCode's adapter retains `--no-browser` only to prevent unattended interactive OAuth/device login; it does not disable ordinary web or network tools.
 
-The runtime lock pins:
+仓库 lock 保留以下开发/测试快照；用户安装器独立管理运行时，不会在 Skill 更新时把依赖装回这些版本：
 
 | Package | Version | npm integrity |
 |---|---:|---|
 | `acpx` | `0.13.2` | `sha512-4hOLEo2kE/nCrPr50StbzU3G1WvzHkmKE/r3vxFAIr6GRI3VSmSRH62XCtnDpVcQNpBM8fVPAeTj39ewVhJwdQ==` |
-| `@agentclientprotocol/claude-agent-acp` | `0.70.0` | `sha512-Psqj6fhV4pQ8IM480zpJ+xGiMMIqNLxlsTj5Mzn+T8KSURCVNJdl0ktcqLMjgHJC/QnOvDdDkFf3xTW9VIV9aQ==` |
-| `@agentclientprotocol/codex-acp` | `1.7.0` | `sha512-+nUhAJyunx8Zc7r3jjLPoMPPUkkk02TmBIosln4l+ugRNUOdNQAMm6toZo7xb+mF1yM5zxJB83qvy/bPmOTaaw==` |
+| `@agentclientprotocol/claude-agent-acp` | `0.75.1` | `sha512-Un6I4BRkhpCFS3I7kr5C/lkAm8Nc3VuGZU2YQ3xIpJAIxV94iWO0Q2CH2QABxMERpONRu4Le6XC9V+5PImQZ2A==` |
+| `@agentclientprotocol/codex-acp` | `1.10.0` | `sha512-b4dDCPkH/GgHRb3JelXz4QdNirdoTjO3yYM1ImUJMxVXxgZLZMguEXNhZOH2G755UKzf6ZypiiC7UHe3fKgp2Q==` |
 
-安装使用 `npm ci --ignore-scripts`，正常委派不会回退到 `npx -y` 动态下载。
+首次安装和显式运行时升级使用 `npm install --save-exact --ignore-scripts`，记录实际版本与 lock hash。普通 Skill 更新保留已有运行时；正常委派不会回退到 `npx -y` 动态下载。
 
 ## 安装模型
 
@@ -143,7 +143,9 @@ agent-delegate cancel --id <delegation_id>
 
 取消确认不代表任务已经停止。按 ID 取消排队任务不会取消正在执行的另一项；`incomplete` 或 `execution_state: unknown` 需要先检查原始事件和已产生的结果，再决定是否重试。同步 `run`、按会话取消和关闭是其他操作，见 [operations.md](plugins/agent-delegation/skills/agent-delegation/references/operations.md)。
 
-运行时直接把 registry 中的 argv 传给 ACPX，项目或全局 alias 不会替换实际 executable。`doctor --to codex --json` 只检查指定目标并显示有效预算；旧版本探针是诊断信息，不再阻断健康目标。
+运行时以 registry 为启动依据，项目或全局 alias 不会替换实际 executable。托管目标通过稳定入口执行本次选定的 argv，因此后续运行时升级不会改变会话命令。`doctor --to codex --json` 显示有效预算，并分别列出 CLI、适配器和 ACPX 的路径、版本；版本变化不构成启动门槛。
+
+Codex/Claude 默认使用本机稳定 CLI 入口，不再使用适配器内置的旧 CLI。收据中的 `runtime_identity` 记录适配器启动时选定的程序。已有 warm 会话继续使用原进程，不能把当前本机版本误当作已运行进程的版本。首次迁移前的命名会话通过 ACPX 本地索引继续原 scope；没有启动记录的旧会话明确标记为未核实。
 
 启动消息在 stderr 给出 receipt 路径。每次真实运行把以下私有收据写入 `~/.local/state/agent-delegation/runs/`：
 
@@ -188,7 +190,15 @@ agent-delegate doctor --json
 
 ## 更新与移除
 
-更新 reviewed checkout 后重新运行 installer。`--hosts kimi` 只安装该宿主 Skill 并配置 Kimi 目标，不依赖其他五个 CLI。可用 `--targets` 分别选择要配置的 ACP 目标，`--hosts none --targets none` 只安装共享 runtime。未选中的既有目标、自定义预算和其他 ACPX 配置会保留；被管理的文件有备份。
+更新 reviewed checkout 后重新运行 installer。普通更新不会运行 npm 或覆盖已有运行时目录。`--hosts kimi` 只安装该宿主 Skill 并配置 Kimi 目标，不依赖其他五个 CLI。可用 `--targets` 分别选择要配置的 ACP 目标，`--hosts none --targets none` 只安装共享 runtime。未选中的既有目标、自定义预算和其他 ACPX 配置会保留；被管理的文件有备份。
+
+需要升级 ACPX 和适配器时，显式执行：
+
+```bash
+python3 scripts/install_user.py install --update-runtime
+```
+
+新版本装入 `~/.local/share/agent-delegation/runtimes/` 下的新目录，成功后切换配置；失败保持原运行时。旧目录保留，供在途进程、旧会话和回退使用。显式升级也会更新已托管的 Codex/Claude 适配器目标，即使本次未选择其 Skill 宿主。版本诊断和回退方法见 [operations.md](plugins/agent-delegation/skills/agent-delegation/references/operations.md)。
 
 ```bash
 python3 scripts/install_user.py uninstall
@@ -205,7 +215,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_
   plugins/agent-delegation/skills/agent-delegation
 ```
 
-已有 pinned ACPX 时，可加跑真实传输回归。测试使用隔离的临时配置和本地 ACP 夹具，不调用模型或读取用户会话：
+已有 ACPX 时，可加跑真实传输回归。测试使用隔离的临时配置和本地 ACP 夹具，不调用模型或读取用户会话；覆盖旧会话迁移、升级后的新进程和已有 warm 会话：
 
 ```bash
 AGENT_DELEGATION_TEST_ACPX=/absolute/path/to/runtime/node_modules/.bin/acpx \

@@ -23,6 +23,7 @@ def serve_fixture() -> None:
     state = Path(os.environ["DELEGATION_FIXTURE_STATE"])
     output_lock = threading.Lock()
     cancelled = threading.Event()
+    native_version = subprocess.check_output([os.environ["CODEX_PATH"], "--version"], text=True).strip() if os.environ.get("DELEGATION_FIXTURE_NATIVE") else "unused"
 
     def send(value: dict) -> None:
         with output_lock:
@@ -37,9 +38,10 @@ def serve_fixture() -> None:
         text = "".join(block.get("text", "") for block in params["prompt"])
         marker = text.rsplit("CASE:", 1)[-1].strip()
         cancelled.clear()
+        response = native_version if marker == "identity" else f"{marker}:turn={turns}"
         send({"method": "session/update", "params": {"sessionId": session, "update": {
             "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": f"{marker}:turn={turns}"}}}})
+            "content": {"type": "text", "text": response}}}})
         if marker == "crash":
             os._exit(8)
         stop = "max_tokens" if marker == "partial" else "end_turn"
@@ -73,7 +75,7 @@ def serve_fixture() -> None:
 
 
 @unittest.skipUnless(os.environ.get("AGENT_DELEGATION_TEST_ACPX"),
-                     "Set AGENT_DELEGATION_TEST_ACPX to the installed pinned ACPX executable")
+                     "Set AGENT_DELEGATION_TEST_ACPX to the installed ACPX executable")
 class NativeTransportTests(unittest.TestCase):
     def test_independent_tasks_continuation_and_interruption(self) -> None:
         with tempfile.TemporaryDirectory(prefix="delegation-acpx-") as temporary:
@@ -86,17 +88,27 @@ class NativeTransportTests(unittest.TestCase):
             preload.write_text("require('node:os').homedir=()=>process.env.DELEGATION_FIXTURE_HOME;"
                                "require('node:module').syncBuiltinESMExports();\n")
             registry = root / "registry.json"
+            native_cli = root / "native-cli"
+            for version in (1, 2):
+                executable = root / f"native-v{version}"
+                executable.write_text(f"#!/bin/sh\necho native-v{version}\n")
+                executable.chmod(0o755)
+            native_cli.symlink_to(root / "native-v1")
+            original_argv = [sys.executable, str(Path(__file__).resolve()), "--fixture"]
             registry.write_text(json.dumps({
                 "schema_version": 1, "acpx_path": os.environ["AGENT_DELEGATION_TEST_ACPX"],
                 "receipt_root": str(root / "receipts"), "default_timeout_seconds": 10,
                 "max_timeout_seconds": 30, "max_delegation_depth": 4,
-                "targets": {"fixture": {"argv": [sys.executable, str(Path(__file__).resolve()), "--fixture"]}},
+                "targets": {"fixture": {"argv": original_argv,
+                    "version_argv": [str(native_cli), "--version"],
+                    "cli_env": {"CODEX_PATH": str(native_cli)}}},
             }))
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith("AGENT_DELEGATION_")}
             env.update(AGENT_DELEGATION_CONFIG=str(registry),
                        DELEGATION_FIXTURE_HOME=str(root / "native-home"),
                        DELEGATION_FIXTURE_STATE=str(root / "state"),
+                       DELEGATION_FIXTURE_NATIVE="1",
                        NODE_OPTIONS="--require " + str(preload))
 
             def command(case: str = "", session: str | None = None, operation: str = "run",
@@ -180,6 +192,43 @@ class NativeTransportTests(unittest.TestCase):
                 self.fail("Task did not reach phase " + phase + ": " + str(result))
 
             try:
+                legacy = run("fresh", session="legacy")
+                config = json.loads(registry.read_text())
+                config["targets"]["fixture"].update(
+                    launch_argv=[sys.executable, str(SCRIPT), "_launch", "--to", "fixture"],
+                    legacy_argv=[original_argv])
+                registry.write_text(json.dumps(config))
+                continued_legacy = run("continue", session="legacy")
+                self.assertEqual(continued_legacy["acp_session_id"], legacy["acp_session_id"])
+                self.assertEqual(continued_legacy["assistant_text"], "continue:turn=2")
+                self.assertEqual(continued_legacy["runtime_identity"]["observation"], "legacy_session_unverified")
+                run(operation="close", session="legacy")
+
+                original = submit("wait", session="upgrade")
+                wait_for_event("wait:turn=1")
+                config["targets"]["fixture"]["argv"] = [*original_argv, "--generation-two"]
+                registry.write_text(json.dumps(config))
+                native_cli.unlink()
+                native_cli.symlink_to(root / "native-v2")
+                independent = run("identity")
+                self.assertEqual(independent["assistant_text"], "native-v2")
+                self.assertEqual(independent["runtime_identity"]["cli"]["version"], "native-v2")
+                self.assertIn("--generation-two", independent["runtime_identity"]["resolved_target_argv"])
+                self.assertEqual(task_control("status", original)["status"], "running")
+                task_control("cancel", original)
+                result = task_control("wait", original, 10)
+                self.assertEqual(result["status"], "cancelled")
+                self.assertEqual(result["runtime_identity"]["cli"]["version"], "native-v1")
+                self.assertNotIn("--generation-two", result["runtime_identity"]["resolved_target_argv"])
+                warm = run("identity", session="upgrade")
+                self.assertEqual(warm["acp_session_id"], result["acp_session_id"])
+                self.assertEqual(warm["assistant_text"], "native-v1")
+                self.assertEqual(warm["runtime_identity"]["cli"]["version"], "native-v1")
+                run(operation="close", session="upgrade")
+                fresh = run("identity", session="upgrade")
+                self.assertEqual(fresh["assistant_text"], "native-v2")
+                self.assertNotEqual(fresh["acp_session_id"], warm["acp_session_id"])
+
                 first, second = [finish(process) for process in [start("fresh"), start("fresh")]]
                 self.assertEqual(first["assistant_text"], "fresh:turn=1")
                 self.assertEqual(second["assistant_text"], "fresh:turn=1")
@@ -308,7 +357,7 @@ class NativeTransportTests(unittest.TestCase):
                     with self.subTest(cleanup_task=task_id):
                         task_control("cancel", {"delegation_id": task_id})
                         task_control("wait", {"delegation_id": task_id}, 15)
-                for session in ("jobs", "budget", "startup"):
+                for session in ("jobs", "budget", "startup", "upgrade", "legacy"):
                     with self.subTest(close_session=session):
                         run(operation="close", session=session)
                 if queued is not None and queued.poll() is None:
@@ -322,7 +371,7 @@ class NativeTransportTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--fixture"]:
+    if sys.argv[1:2] == ["--fixture"]:
         serve_fixture()
     else:
         unittest.main()

@@ -58,6 +58,8 @@ agent-delegate cancel --id <delegation_id>
 
 A cancellation acknowledgement is not proof that work stopped. Use task-ID cancellation for a queued task; session-wide cancellation targets the session's active turn. Cancellation and session closure are conditional controls, not routine result-collection steps. See [operations.md](references/operations.md) for synchronous `run`, session controls, receipts, and recovery.
 
+A native `cancelled` stop reason confirms that the model turn was interrupted. Spawned terminal commands or background jobs may survive it, as observed with Codex. When those jobs also need to stop, inspect and stop the specific jobs through the target's native controls; do not infer process cleanup from the turn's stop reason.
+
 The worker does not automatically inherit the caller's conversation or model. Pass the context it needs; use `--model` only for an explicit model choice, otherwise retain the target's defaults. The wrapper launches the registered argv and records provenance. Agent names may repeat in the chain. Nested workers inherit caller/chain metadata. When metadata is absent, set `--caller` to your actual host label if known; otherwise retain `unknown`. Supply `--chain` only from known provenance.
 
 ## Authority and capabilities
@@ -75,3 +77,5 @@ The start message on stderr identifies a private receipt directory. Events and d
 `success` means the ACP turn ended normally, not that the user's outcome is proven. Integrate the result and verify decision-critical claims proportionally. Tool errors such as a missing optional file do not automatically invalidate a completed turn. Inspect their details instead of requiring an empty error list or repeating all of the worker's work.
 
 There is no default task/result character cap. Timeout and depth come from the registry; `doctor --to <target> --json` shows effective limits and target health. Run it when diagnosing a failure, not as a mandatory gate before each delegation.
+
+Managed targets use the installed local CLI; Codex and Claude adapters bind it explicitly. `runtime_identity` separates CLI, adapter, and ACPX versions observed at startup. A warm session may still use its earlier process. A legacy session without a startup record is marked unverified. Ordinary Skill updates preserve the installed runtime; an explicit `install --update-runtime` upgrades it. See [operations.md](references/operations.md) for update and recovery details.

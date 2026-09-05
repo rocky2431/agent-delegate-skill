@@ -124,6 +124,68 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertNotIn("--no-terminal", payload["command"])
         self.assertFalse((self.root / "receipts").exists())
 
+    def test_launcher_binds_and_records_the_native_cli_without_fallback(self) -> None:
+        native = self.bin / "native cli"
+        native.write_text("#!/bin/sh\necho native-v2\n")
+        native.chmod(0o755)
+        stable = self.bin / "native-current"
+        stable.symlink_to(native)
+        self.target.write_text("#!/usr/bin/env python3\nimport os, subprocess\n"
+                               "print(subprocess.check_output([os.environ['CODEX_PATH'], '--version'], text=True).strip())\n")
+        target = {"argv": [str(self.target)], "version_argv": ["/stale/standalone-cli", "--version"],
+                  "cli_env": {"CODEX_PATH": str(stable)}}
+        runtime_file = self.root / "runtime.json"
+        env = {**self.environment, "CODEX_PATH": "/must-not-run-bundled-cli",
+               "AGENT_DELEGATION_LAUNCH": json.dumps({"name": "beta", "target": target, "acpx_path": str(self.acpx)}),
+               "AGENT_DELEGATION_RUNTIME_RECEIPT": str(runtime_file)}
+        result = self.run_cli("_launch", "--to", "beta", environment=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "native-v2")
+        identity = json.loads(runtime_file.read_text())
+        self.assertEqual(identity["observation"], "adapter_launch")
+        self.assertEqual(identity["cli"]["path"], str(stable))
+        self.assertEqual(identity["cli"]["resolved_path"], str(native.resolve()))
+        self.assertEqual(identity["cli"]["version"], "native-v2")
+        native.unlink()
+        result = self.run_cli("_launch", "--to", "beta", environment=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Native CLI is missing", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_doctor_reports_installed_package_drift_without_a_version_gate(self) -> None:
+        registry = json.loads(self.registry.read_text())
+        runtime = self.root / "runtime"
+        package = runtime / "node_modules/acpx"
+        package.mkdir(parents=True)
+        (package / "package.json").write_text('{"name":"acpx","version":"2.0.0"}')
+        registry.update(runtime_root=str(runtime), runtime_packages={"acpx": "1.0.0"})
+        self.registry.write_text(json.dumps(registry))
+        result = self.run_cli("doctor", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        check = next(check for check in json.loads(result.stdout)["checks"] if check["check"] == "runtime_package:acpx")
+        self.assertTrue(check["ok"])
+        self.assertEqual(check["warning"], "recorded version drift")
+
+    def test_interpreted_cli_identity_names_the_script_not_its_interpreter(self) -> None:
+        cli = self.bin / "cli.py"
+        cli.write_text("print('script-cli 3.0')\n")
+        registry = json.loads(self.registry.read_text())
+        registry["targets"]["beta"].update(cli_path=str(cli), version_argv=[sys.executable, str(cli), "--version"])
+        self.registry.write_text(json.dumps(registry))
+        result = self.run_cli("doctor", "--to", "beta", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        identity = json.loads(result.stdout)["runtimes"]["beta"]["cli"]
+        self.assertEqual(identity["path"], str(cli))
+        self.assertEqual(identity["version"], "script-cli 3.0")
+
+    def test_custom_targets_do_not_inherit_internal_launcher_metadata(self) -> None:
+        self.acpx.write_text(self.acpx.read_text().replace('import json, sys',
+            "import json, sys, os\nassert 'AGENT_DELEGATION_LAUNCH' not in os.environ\n"
+            "assert 'AGENT_DELEGATION_RUNTIME_RECEIPT' not in os.environ"))
+        result = self.run_cli("run", "--to", "beta", "--cwd", str(self.cwd), "--task", "reply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "success")
+
     def test_explicit_restricted_mode_removes_terminal_without_authorization_note(self) -> None:
         result = self.run_cli(
             "run",

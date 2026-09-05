@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Receipt-backed mission delegation through a pinned ACPX runtime."""
+"""Receipt-backed mission delegation through the installed ACPX runtime."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -151,6 +151,17 @@ def _validate_target_record(name: object, target: object) -> None:
         raise DelegationError(f"Target {name!r} must have a non-empty string argv array.")
     if not Path(argv[0]).is_absolute():
         raise DelegationError(f"Target {name!r} argv[0] must be absolute.")
+    launches = target.get("legacy_argv", [])
+    if not isinstance(launches, list):
+        raise DelegationError(f"Target {name!r} legacy_argv must be an array of argv arrays.")
+    for value in [target.get("launch_argv"), *launches]:
+        if value is not None and (not isinstance(value, list) or not value or
+                not all(isinstance(item, str) and item for item in value) or not Path(value[0]).is_absolute()):
+            raise DelegationError(f"Target {name!r} launch commands must have an absolute executable.")
+    cli_env = target.get("cli_env", {})
+    if not isinstance(cli_env, dict) or any(key not in ("CODEX_PATH", "CLAUDE_CODE_EXECUTABLE") or
+            not isinstance(value, str) or not Path(value).is_absolute() for key, value in cli_env.items()):
+        raise DelegationError(f"Target {name!r} cli_env must bind native CLI variables to absolute paths.")
 
 
 def _target(registry: dict[str, Any], name: str) -> dict[str, Any]:
@@ -429,10 +440,9 @@ def _session_turn_lock(receipt_dir: Path, argv: list[str], cwd: Path,
         return
     # ACPX can cancel the active turn, but cannot remove a particular queued turn.
     # Wait before submitting so interrupting a waiter cannot cancel another task.
-    identity = json.dumps([argv, str(cwd), session], ensure_ascii=False)
     lock_root = receipt_dir.parent / ".session-locks"
     lock_root.mkdir(mode=0o700, exist_ok=True)
-    lock_path = lock_root / (hashlib.sha256(identity.encode()).hexdigest() + ".lock")
+    lock_path = lock_root / (_session_key(argv, cwd, session) + ".lock")
     with lock_path.open("a+b") as handle:
         os.chmod(lock_path, 0o600)
         waiting = False
@@ -463,6 +473,33 @@ def _configured_char_limit(registry: dict[str, Any], key: str) -> int | None:
 
 def _normalized_exit_code(code: int) -> int:
     return code if 0 <= code <= 125 else 1
+
+
+def _session_key(argv: list[str], cwd: Path, session: str) -> str:
+    identity = json.dumps([argv, str(cwd), session], ensure_ascii=False)
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _launch_argv(target: dict[str, Any], acpx: str, cwd: Path, session: str | None) -> list[str]:
+    selected = target.get("launch_argv", target["argv"])
+    legacy = target.get("legacy_argv", [])
+    if session and legacy:
+        # Use ACPX's local index, not agent-side session/list (which starts an
+        # adapter). Keep pre-upgrade sessions in their original command scope.
+        for argv in [selected, *legacy]:
+            completed = subprocess.run([acpx, "--agent", shlex.join(argv), "--cwd", str(cwd),
+                "--format", "json", "sessions", "list", "--local"],
+                text=True, capture_output=True, timeout=30, check=False)
+            try:
+                rows = json.loads(completed.stdout)
+            except ValueError as exc:
+                raise DelegationError("Cannot read the native session index: " + completed.stderr[-2000:]) from exc
+            if completed.returncode != 0 or not isinstance(rows, list):
+                raise DelegationError("Cannot read the native session index: " + completed.stdout[-2000:])
+            if any(row.get("name") == session and row.get("cwd") == str(cwd) and
+                   not row.get("closed") for row in rows):
+                return argv
+    return selected
 
 
 def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -501,15 +538,17 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
     delegation_id = uuid.uuid4().hex
     prompt = "" if control else _delegation_context(delegation_id, caller, args.to, chain,
                     max_depth, cwd, args.permissions, args.terminal) + task
-    for label, executable in (("Pinned ACPX", registry["acpx_path"]), ("Target", target["argv"][0])):
-        if control and label == "Target":
+    for label, executable in (("ACPX", registry["acpx_path"]), ("Target", target["argv"][0]),
+                              *[("Native CLI", value) for value in target.get("cli_env", {}).values()]):
+        if control and label != "ACPX":
             continue
         if not Path(executable).is_file() or not os.access(executable, os.X_OK):
             raise DelegationError(f"{label} executable is missing or not executable: {executable}")
 
     # ACPX parses this quoted argv without a shell. The registry is the launch authority;
     # global/project agent aliases cannot silently select a different executable.
-    base = [registry["acpx_path"], "--agent", shlex.join(target["argv"]), "--cwd", str(cwd),
+    selected_argv = _launch_argv(target, registry["acpx_path"], cwd, args.session)
+    base = [registry["acpx_path"], "--agent", shlex.join(selected_argv), "--cwd", str(cwd),
             "--timeout", str(timeout), "--format", "json", "--json-strict", "--suppress-reads",
             PERMISSION_FLAGS[args.permissions], "--non-interactive-permissions", "fail"]
     if not args.terminal:
@@ -532,10 +571,19 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
         "permissions": args.permissions, "terminal": args.terminal,
         "authorization_note": args.authorization_note, "task_source": task_source,
         "task_chars": len(task), "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
-        "target_argv": target["argv"], "session_name": args.session, "requested_model": args.model,
+        "target_argv": selected_argv if selected_argv in target.get("legacy_argv", []) else target["argv"],
+        "session_name": args.session, "requested_model": args.model,
+        "launch_argv": selected_argv,
+        "acpx_path": registry["acpx_path"],
+        "legacy_session": selected_argv != target.get("launch_argv", target["argv"]),
         "operation": args.command,
     }
-    return registry, {"request": request, "commands": commands, "max_result_chars": max_result_chars}
+    # Only public launch metadata travels in the receipt, never ambient secrets.
+    runtime_launch = {"name": args.to, "acpx_path": registry["acpx_path"], "target": {
+        key: target[key] for key in ("argv", "version_argv", "cli_path", "cli_env", "adapter_package", "adapter_version_argv") if key in target}}
+    runtime_launch["target"]["argv"] = request["target_argv"]
+    return registry, {"request": request, "commands": commands, "max_result_chars": max_result_chars,
+                      "runtime_launch": runtime_launch, "use_launcher": selected_argv == target.get("launch_argv")}
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -593,6 +641,17 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
     child_env = {**os.environ, "AGENT_DELEGATION_CALLER": request["target"],
                  "AGENT_DELEGATION_CHAIN": ",".join(request["chain"]),
                  "AGENT_DELEGATION_MAX_DEPTH": str(request["max_depth"])}
+    selected_argv = request.get("launch_argv", request["target_argv"])
+    runtime_file = (receipt_dir.parent / ".session-locks" /
+                    (_session_key(selected_argv, Path(request["cwd"]), session) + ".runtime.json")) if session else receipt_dir / "runtime.json"
+    runtime_launch = launch.get("runtime_launch")
+    child_env.pop("AGENT_DELEGATION_LAUNCH", None)
+    child_env.pop("AGENT_DELEGATION_RUNTIME_RECEIPT", None)
+    if runtime_launch:
+        child_env.update(runtime_launch["target"].get("cli_env", {}))
+        if launch.get("use_launcher", "_launch" in selected_argv):
+            child_env["AGENT_DELEGATION_LAUNCH"] = json.dumps(runtime_launch)
+            child_env["AGENT_DELEGATION_RUNTIME_RECEIPT"] = str(runtime_file)
     state = _read_json_object(receipt_dir / "state.json")
     started = state["created_monotonic"]
     execution_started = None
@@ -631,7 +690,7 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
                 queued = session is not None and not control
                 phase = "queue" if queued else "setup"
                 set_phase("queued" if queued else "starting")
-                with _session_turn_lock(receipt_dir, request["target_argv"], Path(request["cwd"]),
+                with _session_turn_lock(receipt_dir, selected_argv, Path(request["cwd"]),
                                         session if queued else None,
                                         started + queue_timeout if queue_timeout is not None else None,
                                         is_cancelled):
@@ -677,6 +736,15 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
         cancellation_exit_code != 0 or parsed["stop_reason"] not in ("cancelled", "end_turn")
     ):
         status = "incomplete"
+    runtime_identity = None
+    if phase != "queue" and runtime_file.is_file():
+        runtime_identity = _read_json_object(runtime_file)
+    elif runtime_launch:
+        runtime_identity = _runtime_identity(runtime_launch["target"], runtime_launch["acpx_path"], probe=False)
+        runtime_identity["observation"] = "legacy_session_unverified" if request.get("legacy_session") else "launch_unobserved"
+    if runtime_identity:
+        runtime_identity["acpx"] = _package_identity(commands[-1][0][0], "acpx")
+        _atomic_write_json(receipt_dir / "runtime.json", runtime_identity)
     result = {
         "schema": "agent-delegation-result/v1", **parsed, "status": status,
         **{key: request[key] for key in ("delegation_id", "caller", "target", "chain", "cwd",
@@ -690,6 +758,7 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
         "timeout_phase": phase if status == "timeout" or interrupted == "timeout" else None,
         "launch_error": launch_error, "duration_seconds": round(time.monotonic() - started, 3),
         "receipt_dir": str(receipt_dir),
+        "runtime_identity": runtime_identity,
     }
     _atomic_write_json(receipt_dir / "result.json", result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -822,6 +891,89 @@ def _run_version_probe(argv: list[str]) -> tuple[bool, str]:
     return completed.returncode == 0, summary
 
 
+def _package_identity(executable: str, name: str | None = None) -> dict[str, Any]:
+    resolved = Path(executable).resolve()
+    identity: dict[str, Any] = {"path": executable, "resolved_path": str(resolved), "version": None}
+    for parent in resolved.parents:
+        try:
+            package = json.loads((parent / "package.json").read_text())
+            if "version" in package and (name is None or package.get("name") == name):
+                identity.update(package=package.get("name"), version=package["version"])
+                break
+        except (OSError, ValueError, TypeError):
+            continue
+    return identity
+
+
+def _cli_version_argv(target: dict[str, Any]) -> list[str] | None:
+    binding = target.get("cli_env", {})
+    argv = [next(iter(binding.values())), "--version"] if binding else target.get("version_argv")
+    if isinstance(argv, list) and argv and all(isinstance(item, str) and item for item in argv) and Path(argv[0]).is_absolute():
+        return argv
+    return None
+
+
+def _runtime_identity(target: dict[str, Any], acpx: str, probe: bool = True) -> dict[str, Any]:
+    cli = None
+    version_argv = _cli_version_argv(target)
+    if version_argv:
+        path = target.get("cli_path", version_argv[0])
+        cli = {"argv": version_argv, "path": path,
+               "resolved_path": str(Path(path).resolve()), "version": None}
+        if probe:
+            ok, detail = _run_version_probe([str(Path(version_argv[0]).resolve()), *version_argv[1:]])
+            cli.update(version=detail if ok else None, probe_ok=ok, probe_error=None if ok else detail)
+    adapter = None
+    if target.get("adapter_package"):
+        adapter = _package_identity(target["argv"][0], target["adapter_package"])
+    elif (argv := _cli_version_argv({"version_argv": target.get("adapter_version_argv")})):
+        ok, detail = _run_version_probe(argv) if probe else (False, None)
+        adapter = {"path": argv[0], "version": detail if ok else None}
+    return {"observation": "configured", "acpx": _package_identity(acpx, "acpx"),
+            "adapter": adapter, "cli": cli, "cli_binding": target.get("cli_env", {}),
+            "target_argv": target["argv"]}
+
+
+def _launch(args: argparse.Namespace) -> int:
+    raw = os.environ.get("AGENT_DELEGATION_LAUNCH")
+    if raw:
+        try:
+            launch = json.loads(raw)
+        except ValueError as exc:
+            raise DelegationError("Invalid internal launch metadata.") from exc
+        if not isinstance(launch, dict) or launch.get("name") != args.to:
+            raise DelegationError("Internal launch target does not match the requested target.")
+        target, acpx = launch["target"], launch["acpx_path"]
+    else:
+        _, registry = _load_registry()
+        target, acpx = _target(registry, args.to), registry["acpx_path"]
+    _validate_target_record(args.to, target)
+    env = dict(os.environ)
+    receipt = env.pop("AGENT_DELEGATION_RUNTIME_RECEIPT", None)
+    env.pop("AGENT_DELEGATION_LAUNCH", None)
+    argv = [str(Path(target["argv"][0]).resolve()), *target["argv"][1:]]
+    for key, value in target.get("cli_env", {}).items():
+        path = Path(value).resolve()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise DelegationError(f"Native CLI is missing or not executable: {value}")
+        env[key] = str(path)
+    # A warm ACPX owner retains this startup record across turns. Version drift
+    # cannot masquerade as a hot swap of an already running native CLI.
+    version_argv = _cli_version_argv(target)
+    probe_target = dict(target)
+    if version_argv and target.get("cli_env"):
+        probe_target["cli_env"] = {key: env[key] for key in target["cli_env"]}
+    identity = _runtime_identity(probe_target, acpx)
+    if identity["cli"] and version_argv:
+        identity["cli"].update(path=target.get("cli_path", version_argv[0]), argv=version_argv)
+    identity.update(observation="adapter_launch", launched_at=datetime.now(UTC).isoformat(),
+                    adapter_pid=os.getpid(), resolved_target_argv=argv)
+    if receipt:
+        _atomic_write_json(Path(receipt), identity)
+    os.execvpe(argv[0], argv, env)
+    return 0
+
+
 def _doctor(args: argparse.Namespace) -> int:
     _, registry = _load_registry()
     checks: list[dict[str, Any]] = []
@@ -829,6 +981,7 @@ def _doctor(args: argparse.Namespace) -> int:
     checks.append({"check": "acpx_executable", "ok": acpx.is_file() and os.access(acpx, os.X_OK), "detail": str(acpx)})
     names = [args.to] if args.to else sorted(registry["targets"])
     selected_argv: list[str] = [str(acpx)]
+    runtimes = {}
     for name in names:
         try:
             target = _target(registry, name)
@@ -837,16 +990,21 @@ def _doctor(args: argparse.Namespace) -> int:
             continue
         executable = Path(target["argv"][0])
         selected_argv.extend(target["argv"])
+        identity = _runtime_identity(target, str(acpx))
+        runtimes[name] = identity
         checks.append({"check": f"target:{name}:executable", "ok": executable.is_file() and os.access(executable, os.X_OK),
                        "detail": str(executable), "launch_argv": target["argv"]})
-        probe = target.get("version_argv")
-        if isinstance(probe, list) and probe:
-            ok, detail = _run_version_probe(probe)
+        cli = identity["cli"]
+        if cli:
+            ok, detail = cli["probe_ok"], cli["version"] or cli["probe_error"]
             expected = target.get("observed_version")
             drift = isinstance(expected, str) and expected not in detail
             checks.append({"check": f"target:{name}:version_probe", "ok": ok, "required": False,
                            "warning": "informational probe unavailable" if not ok else ("observed version drift" if drift else None),
-                           "detail": detail, "note": "This probe may differ from the CLI bundled by an adapter."})
+                           "detail": detail, "cli_binding": target.get("cli_env", {})})
+        for key, value in target.get("cli_env", {}).items():
+            checks.append({"check": f"target:{name}:{key}", "ok": Path(value).is_file() and os.access(value, os.X_OK),
+                           "detail": value})
     runtime_root_raw = registry.get("runtime_root")
     packages = registry.get("runtime_packages") or {}
     if isinstance(runtime_root_raw, str) and isinstance(packages, dict):
@@ -859,8 +1017,9 @@ def _doctor(args: argparse.Namespace) -> int:
                 observed = json.loads((root / "package.json").read_text())["version"]
             except (OSError, ValueError, KeyError, TypeError):
                 pass
-            checks.append({"check": f"runtime_package:{package}", "ok": observed == expected,
-                           "detail": f"expected {expected}, observed {observed}"})
+            checks.append({"check": f"runtime_package:{package}", "ok": observed is not None,
+                           "warning": "recorded version drift" if observed and observed != expected else None,
+                           "detail": f"recorded {expected}, installed {observed}"})
     limits = {"default_timeout_seconds": registry.get("default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
               "max_timeout_seconds": registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS),
               "max_delegation_depth": registry.get("max_delegation_depth", 4),
@@ -876,7 +1035,8 @@ def _doctor(args: argparse.Namespace) -> int:
         checks.append({"check": "limits", "ok": False, "detail": str(exc)})
     ok = all(check["ok"] for check in checks if check.get("required", True))
     payload = {"status": "ok" if ok else "error", "limits": limits, "checks": checks,
-               "launch_source": "registry argv (passed directly to ACPX)"}
+               "runtimes": runtimes,
+               "launch_source": "registry argv; managed launchers snapshot the selected runtime"}
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -948,7 +1108,7 @@ def _register(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-delegate",
-        description="Delegate missions through a pinned ACPX runtime.",
+        description="Delegate missions through the installed ACPX runtime.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1035,7 +1195,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    if sys.argv[1:2] == ["_worker"]:
+    if sys.argv[1:2] == ["_launch"]:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--to", required=True)
+        parser.set_defaults(handler=_launch)
+        args = parser.parse_args(sys.argv[2:])
+    elif sys.argv[1:2] == ["_worker"]:
         parser = argparse.ArgumentParser()
         parser.add_argument("--receipt-dir", required=True)
         parser.add_argument("--owner-fd", required=True, type=int)
