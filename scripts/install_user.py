@@ -17,7 +17,7 @@ import tempfile
 from typing import Any
 
 
-VERSION = "0.1.3"
+VERSION = "0.2.0"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +30,6 @@ SKILL_SOURCE = (
 )
 RUNTIME_SOURCE = REPO_ROOT / "runtime"
 HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode")
-MANAGED_TARGETS = set(HOSTS)
 RUNTIME_PACKAGES = {
     "acpx": "0.13.2",
     "@agentclientprotocol/claude-agent-acp": "0.70.0",
@@ -198,11 +197,11 @@ def _copy_skill(
 def _resolve_executable(home: Path, candidates: list[Path], names: list[str]) -> Path:
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate.resolve()
+            return candidate.absolute()
     for name in names:
         resolved = shutil.which(name)
         if resolved:
-            path = Path(resolved).resolve()
+            path = Path(resolved).absolute()
             if path.is_file() and os.access(path, os.X_OK):
                 return path
     readable = ", ".join(str(path) for path in candidates) or ", ".join(names)
@@ -281,70 +280,37 @@ def _install_runtime(home: Path, backup: Path, replace_existing: bool) -> tuple[
     return share_root, runtime_root
 
 
-def _build_managed_targets(home: Path, runtime_root: Path) -> dict[str, dict[str, Any]]:
-    hermes = _resolve_executable(home, [home / ".local" / "bin" / "hermes"], ["hermes"])
-    claude = _resolve_executable(home, [home / ".local" / "bin" / "claude"], ["claude"])
-    codex = _resolve_executable(home, [home / ".local" / "bin" / "codex"], ["codex"])
-    kimi = _resolve_executable(home, [home / ".kimi-code" / "bin" / "kimi"], ["kimi"])
-    zcode_acp = _resolve_executable(home, [home / ".local" / "bin" / "zcode-acp"], ["zcode-acp"])
-    opencode = _resolve_executable(home, [home / ".opencode" / "bin" / "opencode"], ["opencode"])
-    node = _resolve_executable(home, [], ["node"])
-    claude_acp = (runtime_root / "node_modules" / ".bin" / "claude-agent-acp").resolve()
-    codex_acp = (runtime_root / "node_modules" / ".bin" / "codex-acp").resolve()
-    for adapter in (claude_acp, codex_acp):
-        if not adapter.is_file() or not os.access(adapter, os.X_OK):
-            raise InstallError(f"Pinned ACP adapter is missing or not executable: {adapter}")
-    zcode_bundle = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
-    if not zcode_bundle.is_file():
-        raise InstallError(f"ZCode CLI bundle is missing: {zcode_bundle}")
-
-    return {
-        "hermes": {
-            "argv": [str(hermes), "acp"],
-            "version_argv": [str(hermes), "--version"],
-            "observed_version": _version_line([str(hermes), "--version"]),
-            "provenance": "existing local Hermes Agent installation",
-        },
-        "claude": {
-            "argv": [str(claude_acp)],
-            "version_argv": [str(claude), "--version"],
-            "observed_version": _version_line([str(claude), "--version"]),
-            "provenance": "@agentclientprotocol/claude-agent-acp@0.70.0 with existing Claude Code",
-        },
-        "codex": {
-            "argv": [str(codex_acp)],
-            "version_argv": [str(codex), "--version"],
-            "observed_version": _version_line([str(codex), "--version"]),
-            "provenance": "@agentclientprotocol/codex-acp@1.7.0 with existing Codex CLI",
-        },
-        "kimi": {
-            "argv": [str(kimi), "acp"],
-            "version_argv": [str(kimi), "--version"],
-            "observed_version": _version_line([str(kimi), "--version"]),
-            "provenance": "existing local Kimi Code installation with native ACP",
-        },
-        "zcode": {
-            "argv": [
-                str(zcode_acp),
-                "--zcode-path",
-                str(zcode_bundle),
-                "--node",
-                str(node),
-                "--prompt-timeout-secs",
-                str(DEFAULT_TIMEOUT_SECONDS),
-                "--no-browser",
-            ],
-            "version_argv": [str(zcode_acp), "--version"],
-            "observed_version": _version_line([str(zcode_acp), "--version"]),
-            "provenance": "existing Ultra-pinned zcode-acp bridge with local ZCode bundle",
-        },
-        "opencode": {
-            "argv": [str(opencode), "acp"],
-            "version_argv": [str(opencode), "--version"],
-            "observed_version": _version_line([str(opencode), "--version"]),
-            "provenance": "existing local OpenCode installation with native ACP",
-        },
+def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> dict[str, dict[str, Any]]:
+    targets: dict[str, dict[str, Any]] = {}
+    candidates = {
+        "hermes": home / ".local/bin/hermes", "claude": home / ".local/bin/claude",
+        "codex": home / ".local/bin/codex", "kimi": home / ".kimi-code/bin/kimi",
+        "zcode": home / ".local/bin/zcode-acp", "opencode": home / ".opencode/bin/opencode",
     }
+    for name in names:
+        command = "zcode-acp" if name == "zcode" else name
+        executable = _resolve_executable(home, [candidates[name]], [command])
+        argv = [str(executable), "acp"]
+        provenance = f"existing local {name} installation with native ACP"
+        if name in ("claude", "codex"):
+            package = "claude-agent-acp" if name == "claude" else "codex-acp"
+            adapter = (runtime_root / "node_modules/.bin" / package).resolve()
+            if not adapter.is_file() or not os.access(adapter, os.X_OK):
+                raise InstallError(f"Pinned ACP adapter is missing or not executable: {adapter}")
+            argv = [str(adapter)]
+            provenance = f"@agentclientprotocol/{package}@{RUNTIME_PACKAGES['@agentclientprotocol/' + package]}"
+        elif name == "zcode":
+            bundle = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
+            if not bundle.is_file():
+                raise InstallError(f"ZCode CLI bundle is missing: {bundle}")
+            node = _resolve_executable(home, [], ["node"])
+            registry = _read_json_object(home / ".config/agent-delegation/config.json")
+            argv = [str(executable), "--zcode-path", str(bundle), "--node", str(node),
+                    "--prompt-timeout-secs", str(registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS)), "--no-browser"]
+        targets[name] = {"argv": argv, "version_argv": [str(executable), "--version"],
+                         "observed_version": _version_line([str(executable), "--version"]),
+                         "provenance": provenance}
+    return targets
 
 
 def _merge_registry(
@@ -361,12 +327,7 @@ def _merge_registry(
     existing_targets = registry.get("targets")
     if existing_targets is not None and not isinstance(existing_targets, dict):
         raise InstallError("Existing delegation targets must be a JSON object.")
-    custom_targets = {
-        name: record
-        for name, record in (existing_targets or {}).items()
-        if name not in MANAGED_TARGETS
-    }
-    targets = {**custom_targets, **managed_targets}
+    targets = {**(existing_targets or {}), **managed_targets}
     registry.update(
         {
             "schema_version": 1,
@@ -391,8 +352,13 @@ def _merge_registry(
     for name, record in targets.items():
         argv = record.get("argv") if isinstance(record, dict) else None
         if not isinstance(argv, list) or not argv:
-            raise InstallError(f"Delegation target {name!r} has invalid argv.")
-        agents[name] = {"argv": argv}
+            if name in managed_targets:
+                raise InstallError(f"Delegation target {name!r} has invalid argv.")
+            continue
+        if name in managed_targets:
+            agents[name] = {"argv": argv}
+        else:
+            agents.setdefault(name, {"argv": argv})
     acpx.setdefault("defaultPermissions", "approve-all")
     acpx.setdefault("nonInteractivePermissions", "fail")
     acpx.setdefault("timeout", DEFAULT_TIMEOUT_SECONDS)
@@ -425,6 +391,7 @@ def _install_symlink(
 def _install(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if args.home else Path.home()
     hosts = _parse_hosts(args.hosts)
+    target_names = _parse_hosts(args.targets) if args.targets is not None else hosts
     if not SKILL_SOURCE.is_dir():
         raise InstallError(f"Missing Skill source {SKILL_SOURCE}.")
     backup = _new_backup_dir(home, "install")
@@ -438,7 +405,7 @@ def _install(args: argparse.Namespace) -> int:
             host,
             args.replace_existing,
         )
-    targets = _build_managed_targets(home, runtime_root)
+    targets = _build_managed_targets(home, runtime_root, target_names)
     registry_path, registry, acpx_config = _merge_registry(
         home, runtime_root, targets, backup
     )
@@ -568,6 +535,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--hosts", default=",".join(HOSTS))
+    install_parser.add_argument("--targets", help="ACP targets to configure; defaults to selected hosts. Use none for runtime/Skill only.")
     install_parser.add_argument("--replace-existing", action="store_true")
     install_parser.set_defaults(handler=_install)
 

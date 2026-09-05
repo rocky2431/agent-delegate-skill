@@ -12,15 +12,17 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.1.3"
+VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -125,13 +127,11 @@ def _load_registry() -> tuple[Path, dict[str, Any]]:
             f"Unsupported registry schema {registry.get('schema_version')!r}; expected {SCHEMA_VERSION}."
         )
     targets = registry.get("targets")
-    if not isinstance(targets, dict) or not targets:
-        raise DelegationError("Registry must contain a non-empty targets object.")
+    if not isinstance(targets, dict):
+        raise DelegationError("Registry must contain a targets object.")
     acpx = registry.get("acpx_path")
     if not isinstance(acpx, str) or not Path(acpx).is_absolute():
         raise DelegationError("Registry acpx_path must be an absolute path.")
-    for name, target in targets.items():
-        _validate_target_record(name, target)
     return path, registry
 
 
@@ -158,6 +158,7 @@ def _target(registry: dict[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(target, dict):
         available = ", ".join(sorted(registry["targets"]))
         raise DelegationError(f"Unknown target {name!r}; available targets: {available}.")
+    _validate_target_record(name, target)
     return target
 
 
@@ -168,25 +169,12 @@ def _acpx_config_path(registry: dict[str, Any]) -> Path:
     return Path(configured)
 
 
-def _assert_acpx_mapping(registry: dict[str, Any], name: str, target: dict[str, Any]) -> None:
-    config_path = _acpx_config_path(registry)
-    config = _read_json_object(config_path)
-    configured = (config.get("agents") or {}).get(name)
-    expected = {"argv": target["argv"]}
-    if configured != expected:
-        raise DelegationError(
-            f"ACPX mapping for {name!r} does not match the reviewed registry; run doctor/install before delegating."
-        )
-
-
 def _parse_chain(raw: str | None, caller: str) -> list[str]:
     chain = [part.strip() for part in raw.split(",")] if raw else [caller]
     if not chain or any(not part for part in chain):
         raise DelegationError("Delegation chain contains an empty entry.")
     if chain[-1] != caller:
-        raise DelegationError("The last delegation-chain entry must be the current caller.")
-    if len(chain) != len(set(chain)):
-        raise DelegationError("Delegation chain already contains a cycle.")
+        chain.append(caller)
     return chain
 
 
@@ -203,7 +191,7 @@ def _read_task(
         task_path = task_path.resolve()
         try:
             task = task_path.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             raise DelegationError(f"Cannot read task file {task_path}: {exc}") from exc
         source = str(task_path)
     elif not sys.stdin.isatty():
@@ -272,57 +260,186 @@ def _session_update(item: dict[str, Any]) -> dict[str, Any]:
     return update if isinstance(update, dict) else {}
 
 
-def _extract_result(
-    events: str, max_chars: int | None
-) -> tuple[str, str | None, list[str], int, bool]:
-    chunks: list[str] = []
-    stop_reason: str | None = None
-    errors: list[str] = []
-    parsed = 0
-    for line in events.splitlines():
+def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, Any]:
+    contents: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    methods: dict[object, str] = {}
+    result: dict[str, Any] = {
+        "stop_reason": None, "acp_session_id": None, "acpx_record_id": None,
+        "parsed_event_count": 0, "unparsed_event_count": 0,
+    }
+    for line in events:
         if not line.strip():
             continue
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
+            result["unparsed_event_count"] += 1
             continue
-        parsed += 1
         if not isinstance(item, dict):
+            result["unparsed_event_count"] += 1
             continue
+        result["parsed_event_count"] += 1
+        request_id = item.get("id")
+        if isinstance(request_id, (str, int)) and isinstance(item.get("method"), str):
+            methods[request_id] = item["method"]
         update = _session_update(item)
         if update.get("sessionUpdate") == "agent_message_chunk":
-            content = update.get("content") or {}
-            if isinstance(content, dict) and content.get("type") == "text":
-                text = content.get("text")
-                if isinstance(text, str):
-                    chunks.append(text)
-        result = item.get("result")
-        if isinstance(result, dict) and isinstance(result.get("stopReason"), str):
-            stop_reason = result["stopReason"]
+            content = update.get("content")
+            if isinstance(content, dict):
+                contents.append(content)
+        params = item.get("params")
+        if isinstance(params, dict) and isinstance(params.get("sessionId"), str):
+            result["acp_session_id"] = params["sessionId"]
+        response = item.get("result")
+        if not isinstance(response, dict) and isinstance(item.get("action"), str):
+            response = item
+        if isinstance(response, dict):
+            if isinstance(response.get("stopReason"), str):
+                result["stop_reason"] = response["stopReason"]
+            for source, dest in (("sessionId", "acp_session_id"), ("acpSessionId", "acp_session_id"),
+                                 ("acpxSessionId", "acp_session_id"), ("acpxRecordId", "acpx_record_id"),
+                                 ("agentSessionId", "agent_session_id")):
+                if isinstance(response.get(source), str):
+                    result[dest] = response[source]
+            if isinstance(response.get("action"), str):
+                result["action"] = response["action"]
+            if isinstance(response.get("cancelled"), bool):
+                result["cancel_requested"] = response["cancelled"]
         error = item.get("error")
         if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str):
-                errors.append(message)
-    full_text = "".join(chunks)
-    if max_chars is None:
-        return full_text, stop_reason, errors, parsed, False
-    truncated = len(full_text) > max_chars
-    assistant_text = full_text[:max_chars]
-    return assistant_text, stop_reason, errors, parsed, truncated
+            method = methods.get(request_id) if isinstance(request_id, (str, int)) else None
+            scope = "tool" if method and (method.startswith(("fs/", "terminal/")) or method == "session/request_permission") else "rpc"
+            errors.append({**error, "request_id": request_id, "method": method, "scope": scope})
+        if "result" in item or "error" in item:
+            if isinstance(request_id, (str, int)):
+                methods.pop(request_id, None)
+    full_text = "".join(c.get("text", "") for c in contents if c.get("type") == "text" and isinstance(c.get("text"), str))
+    result.update({
+        "assistant_text": full_text if max_chars is None else full_text[:max_chars],
+        "assistant_text_truncated": max_chars is not None and len(full_text) > max_chars,
+        "assistant_content": contents,
+        "rpc_errors": errors,
+        "tool_errors": [error for error in errors if error["scope"] == "tool"],
+        # Keep the legacy field, without labeling ordinary client operations as protocol failures.
+        "protocol_errors": [error.get("message", "") for error in errors if error["scope"] != "tool"],
+    })
+    return result
+
+
+def _result_status(code: int, parsed: dict[str, Any], interrupted: str | None, control: bool) -> str:
+    if interrupted:
+        return interrupted
+    stop = parsed["stop_reason"]
+    if stop == "cancelled" or code == 130:
+        return "cancelled"
+    if code == 3 or code == 124:
+        return "timeout"
+    if code == 5:
+        return "denied"
+    if code == 4:
+        return "not_found"
+    if code != 0:
+        return "error"
+    if control:
+        return "success" if parsed.get("action") else "incomplete"
+    if stop == "end_turn":
+        return "success"
+    if stop == "refusal":
+        return "refused"
+    return "error" if parsed["protocol_errors"] and not stop else "incomplete"
+
+
+def _positive_int(raw: Any, label: str) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise DelegationError(f"{label} must be a positive integer.") from exc
+    if isinstance(raw, bool) or str(value) != str(raw) or value < 1:
+        raise DelegationError(f"{label} must be a positive integer.")
+    return value
+
+
+def _stop_process(process: subprocess.Popen) -> None:
+    # ACPX gets a chance to cancel the turn and close its agent before forced cleanup.
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            continue
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+
+
+def _stream_command(command: list[str], prompt: str, env: dict[str, str], timeout: float,
+                    stdout: Any, stderr: Any,
+                    on_interrupt: Callable[[], None] | None = None) -> tuple[int, str | None]:
+    # File descriptors preserve streamed bytes even when the process is interrupted.
+    with tempfile.TemporaryFile() as task_input:
+        task_input.write(prompt.encode("utf-8"))
+        task_input.seek(0)
+        process = subprocess.Popen(command, stdin=task_input, stdout=stdout, stderr=stderr,
+                                   env=env, start_new_session=True)
+        try:
+            return process.wait(timeout=max(0.001, timeout)), None
+        except subprocess.TimeoutExpired:
+            code, reason = 124, "timeout"
+        except KeyboardInterrupt:
+            code, reason = 130, "cancelled"
+        if on_interrupt:
+            on_interrupt()
+            try:
+                # Keep the waiting client alive to receive the turn's terminal event.
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _stop_process(process)
+        else:
+            _stop_process(process)
+        return code, reason
+
+
+@contextmanager
+def _session_turn_lock(receipt_dir: Path, argv: list[str], cwd: Path,
+                       session: str | None, deadline: float) -> Iterator[None]:
+    if session is None:
+        yield
+        return
+    # ACPX can cancel the active turn, but cannot remove a particular queued turn.
+    # Wait before submitting so interrupting a waiter cannot cancel another task.
+    identity = json.dumps([argv, str(cwd), session], ensure_ascii=False)
+    lock_root = receipt_dir.parent / ".session-locks"
+    lock_root.mkdir(mode=0o700, exist_ok=True)
+    lock_path = lock_root / (hashlib.sha256(identity.encode()).hexdigest() + ".lock")
+    with lock_path.open("a+b") as handle:
+        os.chmod(lock_path, 0o600)
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not waiting:
+                    print(json.dumps({"status": "waiting", "session_name": session,
+                                      "receipt_dir": str(receipt_dir)}), file=sys.stderr, flush=True)
+                    waiting = True
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out waiting for the session's current turn.")
+                time.sleep(0.1)
+        # Closing the descriptor releases the lock, including on interruption.
+        yield
 
 
 def _configured_char_limit(registry: dict[str, Any], key: str) -> int | None:
     raw = registry.get(key)
     if raw is None:
         return None
-    try:
-        limit = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise DelegationError(f"Registry {key} must be a positive integer when configured.") from exc
-    if limit < 1:
-        raise DelegationError(f"Registry {key} must be a positive integer when configured.")
-    return limit
+    return _positive_int(raw, f"Registry {key}")
 
 
 def _normalized_exit_code(code: int) -> int:
@@ -332,192 +449,160 @@ def _normalized_exit_code(code: int) -> int:
 def _run(args: argparse.Namespace) -> int:
     _, registry = _load_registry()
     target = _target(registry, args.to)
-    _assert_acpx_mapping(registry, args.to, target)
-
-    caller = args.caller or os.environ.get("AGENT_DELEGATION_CALLER")
-    if not caller:
-        raise DelegationError("Caller is required; pass --caller or use an injected delegation environment.")
-    if caller != "human" and caller not in registry["targets"]:
-        raise DelegationError(f"Caller {caller!r} is neither human nor a registered target.")
-    if caller == args.to:
-        raise DelegationError("Direct self-delegation is not allowed.")
-
-    chain_raw = args.chain
-    if chain_raw is None:
-        chain_raw = os.environ.get("AGENT_DELEGATION_CHAIN")
-    chain = _parse_chain(chain_raw, caller)
-    if args.to in chain:
-        raise DelegationError(f"Target {args.to!r} already appears in the delegation chain.")
-
-    configured_depth = int(registry.get("max_delegation_depth", 4))
-    inherited_depth_raw = os.environ.get("AGENT_DELEGATION_MAX_DEPTH")
-    try:
-        inherited_depth = int(inherited_depth_raw) if inherited_depth_raw else configured_depth
-    except ValueError as exc:
-        raise DelegationError("Injected AGENT_DELEGATION_MAX_DEPTH is not an integer.") from exc
-    max_depth = args.max_depth if args.max_depth is not None else inherited_depth
-    if max_depth < 1 or max_depth > configured_depth:
-        raise DelegationError(f"max-depth must be between 1 and configured ceiling {configured_depth}.")
-    if len(chain) > max_depth:
-        raise DelegationError(f"Delegation depth {len(chain)} exceeds maximum {max_depth}.")
+    control = args.command in ("cancel", "close")
+    caller = (args.caller or os.environ.get("AGENT_DELEGATION_CALLER") or "unknown").strip()
+    if not caller or "," in caller:
+        raise DelegationError("Caller must be a non-empty label without commas.")
+    chain = [caller] if control else _parse_chain(args.chain if args.chain is not None else os.environ.get("AGENT_DELEGATION_CHAIN"), caller)
+    configured_depth = 1 if control else _positive_int(registry.get("max_delegation_depth", 4), "max_delegation_depth")
+    inherited_depth = 1 if control else _positive_int(os.environ.get("AGENT_DELEGATION_MAX_DEPTH", configured_depth), "inherited max depth")
+    ceiling = min(configured_depth, inherited_depth)
+    max_depth = args.max_depth if args.max_depth is not None else ceiling
+    if not control and (max_depth < 1 or max_depth > ceiling or len(chain) > max_depth):
+        raise DelegationError(f"Delegation depth {len(chain)} must fit max-depth 1..{ceiling} (requested {max_depth}).")
 
     cwd = Path(args.cwd).expanduser().resolve()
     if not cwd.is_dir():
         raise DelegationError(f"Delegation cwd is not an existing directory: {cwd}")
-
-    configured_timeout = int(
-        registry.get("default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
-    )
-    timeout = args.timeout if args.timeout is not None else configured_timeout
-    max_timeout = int(registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS))
+    timeout = args.timeout if args.timeout is not None else _positive_int(
+        registry.get("default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS), "default_timeout_seconds")
+    max_timeout = timeout if control else _positive_int(registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS), "max_timeout_seconds")
     if timeout < 1 or timeout > max_timeout:
         raise DelegationError(f"timeout must be between 1 and {max_timeout} seconds.")
-
-    permissions = args.permissions
-    max_task_chars = _configured_char_limit(registry, "max_task_chars")
-    task, task_source = _read_task(args, cwd, max_task_chars)
+    max_task_chars = None if control else _configured_char_limit(registry, "max_task_chars")
+    max_result_chars = None if control else _configured_char_limit(registry, "max_result_chars")
+    task, task_source = ("", "control") if control else _read_task(args, cwd, max_task_chars)
+    if args.session is not None:
+        args.session = args.session.strip()
+        if not args.session:
+            raise DelegationError("Session name must not be empty.")
     delegation_id = uuid.uuid4().hex
-    prompt = _delegation_context(
-        delegation_id,
-        caller,
-        args.to,
-        chain,
-        max_depth,
-        cwd,
-        permissions,
-        args.terminal,
-    ) + task
+    prompt = "" if control else _delegation_context(delegation_id, caller, args.to, chain,
+                    max_depth, cwd, args.permissions, args.terminal) + task
+    for label, executable in (("Pinned ACPX", registry["acpx_path"]), ("Target", target["argv"][0])):
+        if control and label == "Target":
+            continue
+        if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+            raise DelegationError(f"{label} executable is missing or not executable: {executable}")
 
-    acpx = Path(registry["acpx_path"])
-    if not acpx.is_file() or not os.access(acpx, os.X_OK):
-        raise DelegationError(f"Pinned ACPX executable is missing or not executable: {acpx}")
-    executable = Path(target["argv"][0])
-    if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise DelegationError(f"Target executable is missing or not executable: {executable}")
-
-    command = [
-        str(acpx),
-        "--cwd",
-        str(cwd),
-        "--timeout",
-        str(timeout),
-        "--format",
-        "json",
-        "--json-strict",
-        "--suppress-reads",
-        PERMISSION_FLAGS[permissions],
-        "--non-interactive-permissions",
-        "fail",
-    ]
+    # ACPX parses this quoted argv without a shell. The registry is the launch authority;
+    # global/project agent aliases cannot silently select a different executable.
+    base = [registry["acpx_path"], "--agent", shlex.join(target["argv"]), "--cwd", str(cwd),
+            "--timeout", str(timeout), "--format", "json", "--json-strict", "--suppress-reads",
+            PERMISSION_FLAGS[args.permissions], "--non-interactive-permissions", "fail"]
     if not args.terminal:
-        command.append("--no-terminal")
-    command.extend([args.to, "exec", "--file", "-"])
-
-    if args.dry_run:
-        print(
-            json.dumps(
-                {
-                    "status": "dry_run",
-                    "delegation_id": delegation_id,
-                    "caller": caller,
-                    "target": args.to,
-                    "chain": [*chain, args.to],
-                    "cwd": str(cwd),
-                    "timeout_seconds": timeout,
-                    "permissions": permissions,
-                    "terminal": args.terminal,
-                    "command": command,
-                    "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return 0
-
-    receipt_dir = _new_receipt_dir(registry, delegation_id)
+        base.append("--no-terminal")
+    if args.model:
+        base.extend(["--model", args.model])
+    if control:
+        suffix = ["cancel", "--session", args.session] if args.command == "cancel" else ["sessions", "close", args.session]
+        commands = [(base + suffix, "")]
+    elif args.session:
+        commands = [(base + ["sessions", "ensure", "--name", args.session], ""),
+                    (base + ["prompt", "--session", args.session, "--file", "-"], prompt)]
+    else:
+        commands = [(base + ["exec", "--file", "-"], prompt)]
     request = {
-        "schema": "agent-delegation-request/v1",
-        "delegation_id": delegation_id,
-        "created_at": datetime.now(UTC).isoformat(),
-        "caller": caller,
-        "target": args.to,
-        "chain": [*chain, args.to],
-        "cwd": str(cwd),
-        "timeout_seconds": timeout,
-        "permissions": permissions,
-        "terminal": args.terminal,
-        "authorization_note": args.authorization_note,
-        "task_source": task_source,
-        "task_chars": len(task),
-        "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
-        "target_argv": target["argv"],
+        "schema": "agent-delegation-request/v1", "delegation_id": delegation_id,
+        "created_at": datetime.now(UTC).isoformat(), "caller": caller, "target": args.to,
+        "chain": [*chain, args.to], "cwd": str(cwd), "timeout_seconds": timeout,
+        "permissions": args.permissions, "terminal": args.terminal,
+        "authorization_note": args.authorization_note, "task_source": task_source,
+        "task_chars": len(task), "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
+        "target_argv": target["argv"], "session_name": args.session, "requested_model": args.model,
+        "operation": args.command,
     }
+    if args.dry_run:
+        print(json.dumps({**request, "status": "dry_run", "command": commands[-1][0],
+                          "commands": [command for command, _ in commands]}, ensure_ascii=False, indent=2))
+        return 0
+    receipt_dir = _new_receipt_dir(registry, delegation_id)
     _atomic_write_json(receipt_dir / "request.json", request)
-
-    child_env = os.environ.copy()
-    child_env["AGENT_DELEGATION_CALLER"] = args.to
-    child_env["AGENT_DELEGATION_CHAIN"] = ",".join([*chain, args.to])
-    child_env["AGENT_DELEGATION_MAX_DEPTH"] = str(max_depth)
+    child_env = {**os.environ, "AGENT_DELEGATION_CALLER": args.to,
+                 "AGENT_DELEGATION_CHAIN": ",".join([*chain, args.to]),
+                 "AGENT_DELEGATION_MAX_DEPTH": str(max_depth)}
+    print(json.dumps({"status": "running", "delegation_id": delegation_id,
+                      "receipt_dir": str(receipt_dir)}), file=sys.stderr, flush=True)
     started = time.monotonic()
-    timed_out = False
+    return_code, interrupted, launch_error, cancellation_exit_code = 1, None, None, None
+    def handle_termination(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+    previous_handler = signal.signal(signal.SIGTERM, handle_termination)
     try:
-        completed = subprocess.run(
-            command,
-            input=prompt,
-            text=True,
-            capture_output=True,
-            env=child_env,
-            timeout=timeout + 30,
-            check=False,
-        )
-        stdout = completed.stdout
-        stderr = completed.stderr
-        return_code = completed.returncode
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        stderr += "\n[agent-delegate] outer timeout expired after ACPX grace period.\n"
-        return_code = 124
-    duration = time.monotonic() - started
-
-    _atomic_write_text(receipt_dir / "events.ndjson", stdout)
-    _atomic_write_text(receipt_dir / "stderr.log", stderr)
-    max_result_chars = _configured_char_limit(registry, "max_result_chars")
-    assistant_text, stop_reason, errors, parsed_events, text_truncated = _extract_result(
-        stdout, max_result_chars
-    )
-    status = "timeout" if timed_out else ("success" if return_code == 0 else "error")
+        with (receipt_dir / "events.ndjson").open("xb", buffering=0) as stdout, (receipt_dir / "stderr.log").open("xb", buffering=0) as stderr:
+            os.chmod(stdout.name, 0o600)
+            os.chmod(stderr.name, 0o600)
+            def cancel_named_turn() -> None:
+                nonlocal cancellation_exit_code
+                try:
+                    cancellation_exit_code, _ = _stream_command(
+                        base + ["cancel", "--session", args.session], "", child_env, 10, stdout, stderr)
+                except OSError as exc:
+                    cancellation_exit_code = 1
+                    stderr.write((str(exc) + "\n").encode())
+            try:
+                with _session_turn_lock(receipt_dir, target["argv"], cwd,
+                                        args.session if not control else None, started + timeout):
+                    prompt_started = False
+                    try:
+                        for command, command_input in commands:
+                            prompt_started = bool(command_input)
+                            return_code, interrupted = _stream_command(command, command_input, child_env,
+                                timeout + 30 - (time.monotonic() - started), stdout, stderr,
+                                cancel_named_turn if args.session and prompt_started and not control else None)
+                            if return_code != 0 or interrupted:
+                                break
+                    except KeyboardInterrupt:
+                        return_code, interrupted = 130, "cancelled"
+                    finally:
+                        if interrupted and args.session and prompt_started and not control and cancellation_exit_code is None:
+                            cancel_named_turn()
+            except KeyboardInterrupt:
+                return_code, interrupted = 130, "cancelled"
+            except TimeoutError as exc:
+                return_code, interrupted = 124, "timeout"
+                stderr.write((str(exc) + "\n").encode())
+            except OSError as exc:
+                launch_error = str(exc)
+                stderr.write((launch_error + "\n").encode())
+                return_code = 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+    with (receipt_dir / "events.ndjson").open(encoding="utf-8", errors="replace") as events:
+        parsed = _extract_result(events, max_result_chars)
+    status = _result_status(return_code, parsed, interrupted, control)
+    if cancellation_exit_code is not None and (
+        cancellation_exit_code != 0 or parsed["stop_reason"] not in ("cancelled", "end_turn")
+    ):
+        status = "incomplete"
     result = {
-        "schema": "agent-delegation-result/v1",
-        "status": status,
-        "delegation_id": delegation_id,
-        "caller": caller,
-        "target": args.to,
-        "chain": [*chain, args.to],
-        "cwd": str(cwd),
-        "exit_code": return_code,
-        "stop_reason": stop_reason,
-        "assistant_text": assistant_text,
-        "assistant_text_truncated": text_truncated,
-        "protocol_errors": errors,
-        "parsed_event_count": parsed_events,
-        "duration_seconds": round(duration, 3),
+        "schema": "agent-delegation-result/v1", **parsed, "status": status,
+        "delegation_id": delegation_id, "caller": caller, "target": args.to,
+        "chain": [*chain, args.to], "cwd": str(cwd), "exit_code": return_code,
+        "session_name": args.session, "requested_model": args.model, "operation": args.command,
+        "timeout_seconds": timeout, "cancellation_exit_code": cancellation_exit_code,
+        "launch_error": launch_error, "duration_seconds": round(time.monotonic() - started, 3),
         "receipt_dir": str(receipt_dir),
     }
     _atomic_write_json(receipt_dir / "result.json", result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return _normalized_exit_code(return_code)
+    if status == "success":
+        return 0
+    return {"cancelled": 130, "timeout": 124, "denied": 5}.get(status, _normalized_exit_code(return_code) or 1)
+
+
 def _list_targets(args: argparse.Namespace) -> int:
     _, registry = _load_registry()
     rows = []
     for name in sorted(registry["targets"]):
         target = registry["targets"][name]
+        if not isinstance(target, dict):
+            rows.append({"name": name, "argv": [], "observed_version": None, "provenance": "invalid record; run doctor"})
+            continue
         rows.append(
             {
                 "name": name,
-                "argv": target["argv"],
+                "argv": target.get("argv", []),
                 "observed_version": target.get("observed_version"),
                 "provenance": target.get("provenance"),
             }
@@ -526,7 +611,7 @@ def _list_targets(args: argparse.Namespace) -> int:
         print(json.dumps({"schema_version": SCHEMA_VERSION, "targets": rows}, indent=2))
     else:
         for row in rows:
-            print(f"{row['name']}\t{row['observed_version'] or '-'}\t{row['argv'][0]}")
+            print(f"{row['name']}\t{row['observed_version'] or '-'}\t{row['argv'][0] if row['argv'] else '-'}")
     return 0
 
 
@@ -550,71 +635,64 @@ def _doctor(args: argparse.Namespace) -> int:
     _, registry = _load_registry()
     checks: list[dict[str, Any]] = []
     acpx = Path(registry["acpx_path"])
-    checks.append(
-        {
-            "check": "acpx_executable",
-            "ok": acpx.is_file() and os.access(acpx, os.X_OK),
-            "detail": str(acpx),
-        }
-    )
-    acpx_config = _read_json_object(_acpx_config_path(registry))
-    configured_agents = acpx_config.get("agents") or {}
-    for name, target in sorted(registry["targets"].items()):
+    checks.append({"check": "acpx_executable", "ok": acpx.is_file() and os.access(acpx, os.X_OK), "detail": str(acpx)})
+    names = [args.to] if args.to else sorted(registry["targets"])
+    selected_argv: list[str] = [str(acpx)]
+    for name in names:
+        try:
+            target = _target(registry, name)
+        except DelegationError as exc:
+            checks.append({"check": f"target:{name}:record", "ok": False, "detail": str(exc)})
+            continue
         executable = Path(target["argv"][0])
-        checks.append(
-            {
-                "check": f"target:{name}:executable",
-                "ok": executable.is_file() and os.access(executable, os.X_OK),
-                "detail": str(executable),
-            }
-        )
-        checks.append(
-            {
-                "check": f"target:{name}:acpx_mapping",
-                "ok": configured_agents.get(name) == {"argv": target["argv"]},
-                "detail": "structured argv matches" if configured_agents.get(name) == {"argv": target["argv"]} else "registry mismatch",
-            }
-        )
+        selected_argv.extend(target["argv"])
+        checks.append({"check": f"target:{name}:executable", "ok": executable.is_file() and os.access(executable, os.X_OK),
+                       "detail": str(executable), "launch_argv": target["argv"]})
         probe = target.get("version_argv")
         if isinstance(probe, list) and probe:
             ok, detail = _run_version_probe(probe)
             expected = target.get("observed_version")
             drift = isinstance(expected, str) and expected not in detail
-            checks.append(
-                {
-                    "check": f"target:{name}:version_probe",
-                    "ok": ok,
-                    "warning": "observed version drift" if ok and drift else None,
-                    "detail": detail,
-                }
-            )
+            checks.append({"check": f"target:{name}:version_probe", "ok": ok, "required": False,
+                           "warning": "informational probe unavailable" if not ok else ("observed version drift" if drift else None),
+                           "detail": detail, "note": "This probe may differ from the CLI bundled by an adapter."})
     runtime_root_raw = registry.get("runtime_root")
     packages = registry.get("runtime_packages") or {}
     if isinstance(runtime_root_raw, str) and isinstance(packages, dict):
-        runtime_root = Path(runtime_root_raw)
-        for package, expected_version in sorted(packages.items()):
-            package_json = runtime_root / "node_modules" / Path(*package.split("/")) / "package.json"
+        for package, expected in sorted(packages.items()):
+            root = Path(runtime_root_raw) / "node_modules" / package
+            if args.to and not any(Path(arg).is_absolute() and Path(arg).is_relative_to(root) for arg in selected_argv):
+                continue
             observed = None
             try:
-                observed = json.loads(package_json.read_text(encoding="utf-8")).get("version")
-            except (OSError, json.JSONDecodeError, AttributeError):
+                observed = json.loads((root / "package.json").read_text())["version"]
+            except (OSError, ValueError, KeyError, TypeError):
                 pass
-            checks.append(
-                {
-                    "check": f"runtime_package:{package}",
-                    "ok": observed == expected_version,
-                    "detail": f"expected {expected_version}, observed {observed}",
-                }
-            )
-    ok = all(check.get("ok") is True for check in checks)
-    payload = {"status": "ok" if ok else "error", "checks": checks}
+            checks.append({"check": f"runtime_package:{package}", "ok": observed == expected,
+                           "detail": f"expected {expected}, observed {observed}"})
+    limits = {"default_timeout_seconds": registry.get("default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+              "max_timeout_seconds": registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS),
+              "max_delegation_depth": registry.get("max_delegation_depth", 4),
+              "max_task_chars": registry.get("max_task_chars"), "max_result_chars": registry.get("max_result_chars")}
+    try:
+        for key in ("default_timeout_seconds", "max_timeout_seconds", "max_delegation_depth"):
+            limits[key] = _positive_int(limits[key], key)
+        for key in ("max_task_chars", "max_result_chars"):
+            _configured_char_limit(registry, key)
+        if limits["default_timeout_seconds"] > limits["max_timeout_seconds"]:
+            raise DelegationError("Default timeout exceeds configured maximum.")
+    except DelegationError as exc:
+        checks.append({"check": "limits", "ok": False, "detail": str(exc)})
+    ok = all(check["ok"] for check in checks if check.get("required", True))
+    payload = {"status": "ok" if ok else "error", "limits": limits, "checks": checks,
+               "launch_source": "registry argv (passed directly to ACPX)"}
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         for check in checks:
-            marker = "ok" if check["ok"] else "FAIL"
-            suffix = f" ({check['warning']})" if check.get("warning") else ""
-            print(f"{marker}\t{check['check']}\t{check['detail']}{suffix}")
+            marker = "WARN" if check.get("warning") else ("ok" if check["ok"] else "FAIL")
+            print(f"{marker}\t{check['check']}\t{check['detail']}")
+        print(json.dumps(limits))
     return 0 if ok else 1
 
 
@@ -690,18 +768,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="Validate runtime, registry, and targets.")
     doctor_parser.add_argument("--json", action="store_true")
+    doctor_parser.add_argument("--to", help="Check only this target and its runtime dependencies.")
     doctor_parser.set_defaults(handler=_doctor)
 
-    run_parser = subparsers.add_parser("run", help="Run one stateless delegated task.")
+    run_parser = subparsers.add_parser("run", help="Run a delegated task, optionally in a named ACPX session.")
     run_parser.add_argument("--to", required=True, help="Registered target name.")
-    run_parser.add_argument("--caller", help="Current host, or human for direct operator use.")
-    run_parser.add_argument("--chain", help="Comma-separated chain ending in the current caller.")
-    run_parser.add_argument("--max-depth", type=int, help="May lower but not raise the configured ceiling.")
+    run_parser.add_argument("--caller", help="Source label; defaults to the inherited caller or unknown.")
+    run_parser.add_argument("--chain", help="Comma-separated provenance chain; repeated targets are allowed.")
+    run_parser.add_argument("--max-depth", type=int, help="May lower the inherited/configured depth budget.")
     run_parser.add_argument("--cwd", required=True, help="Existing absolute or resolvable task directory.")
     task_group = run_parser.add_mutually_exclusive_group()
     task_group.add_argument("--task", help="Short task text; prefer --task-file for long packets.")
     task_group.add_argument("--task-file", help="UTF-8 mission envelope path, or pipe mission text on stdin.")
-    run_parser.add_argument("--timeout", type=int, help="Timeout in seconds.")
+    run_parser.add_argument("--timeout", type=int, help="Timeout in seconds, within the configured budget.")
+    run_parser.add_argument("--session", help="Ensure and continue a named native ACPX session.")
+    run_parser.add_argument("--model", help="Explicit target model; omitted to retain target defaults.")
     run_parser.add_argument(
         "--permissions",
         choices=sorted(PERMISSION_FLAGS),
@@ -728,6 +809,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--dry-run", action="store_true", help="Validate and print the launch plan only.")
     run_parser.set_defaults(terminal=True, handler=_run)
 
+    for operation in ("cancel", "close"):
+        control = subparsers.add_parser(operation, help=f"{operation.capitalize()} a named native ACPX session.")
+        control.add_argument("--to", required=True)
+        control.add_argument("--cwd", required=True)
+        control.add_argument("--session", required=True)
+        control.add_argument("--timeout", type=int, default=30)
+        control.add_argument("--dry-run", action="store_true")
+        control.set_defaults(handler=_run, caller=None, chain=None, max_depth=None,
+                             model=None, permissions="approve-all", terminal=True, authorization_note=None)
+
     register_parser = subparsers.add_parser("register", help="Register an additional reviewed ACP target.")
     register_parser.add_argument("--name", required=True)
     register_parser.add_argument("--argv-json", required=True, help="JSON string array with absolute executable.")
@@ -744,7 +835,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return int(args.handler(args))
-    except DelegationError as exc:
+    except (DelegationError, OSError) as exc:
         print(
             json.dumps(
                 {"status": "error", "type": "delegation_error", "message": str(exc)},

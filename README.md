@@ -15,10 +15,10 @@ Any host CLI
 ## 为什么是 Skill + wrapper + ACPX
 
 - **Agent Skill**：告诉不同模型何时委派、怎样表达 mission envelope，以及如何携带已有授权而不创造新授权。
-- **`agent-delegate`**：机械执行 cwd、timeout、permission mode、私有 receipt、调用链和循环保护。
-- **ACPX**：负责 ACP 初始化、临时 session、prompt、取消、结构化事件和稳定退出码。
+- **`agent-delegate`**：记录调用来源，执行任务预算与显式权限模式，并保留流式收据和完整内容块。
+- **ACPX**：负责 ACP 初始化、独立或持久会话、prompt、取消、结构化事件和退出码。
 
-只装 ACPX 缺少共享语义和防循环边界；只装 Skill 又无法可靠执行这些机械约束。
+Skill 说明任务语义；wrapper 负责来源、预算和结果；会话生命周期复用 ACPX 原生能力。
 
 ## 当前目标
 
@@ -69,7 +69,8 @@ Skill locations:
 
 ```bash
 python3 scripts/install_user.py install \
-  --hosts hermes,claude,kimi,zcode,opencode
+  --hosts hermes,claude,kimi,zcode,opencode \
+  --targets hermes,claude,codex,kimi,zcode,opencode
 ```
 
 从本地 checkout 安装 Codex plugin：
@@ -109,16 +110,33 @@ agent-delegate run \
   --task-file /absolute/delegation-envelope.md
 ```
 
-从已委派的 Agent 再委派时，wrapper 会注入 `AGENT_DELEGATION_CALLER`、`AGENT_DELEGATION_CHAIN` 和深度上限。直接自委派、回到链上已有 Agent、超过深度都会失败。
+从已委派的 Agent 再委派时，wrapper 会注入 `AGENT_DELEGATION_CALLER`、`AGENT_DELEGATION_CHAIN` 和深度上限。同名 Agent 可以启动独立任务，调用链也允许重复名称；来源标识不要求同时注册为可调用目标。深度预算仍会生效。
 
-每次真实运行把以下私有收据写入 `~/.local/state/agent-delegation/runs/`：
+需要多轮工作时使用命名会话，后续沿用同一 target、cwd 和 session：
 
-- `request.json`：边界、hash、版本 argv；不保存原始 task 文本；
-- `events.ndjson`：ACPX 结构化事件，读取内容默认被抑制；
-- `stderr.log`；
-- `result.json`：标准化状态、stop reason、最终文本和耗时。
+```bash
+agent-delegate run --to codex --caller hermes --cwd /absolute/task/root \
+  --session review --task 'Investigate the issue and identify missing information.'
+agent-delegate run --to codex --caller hermes --cwd /absolute/task/root \
+  --session review --task 'Here is the detail. Continue.'
+agent-delegate cancel --to codex --cwd /absolute/task/root --session review
+agent-delegate close --to codex --cwd /absolute/task/root --session review
+```
 
-wrapper 默认不限制 task 或标准化结果的字符数，也不会在标准化时裁掉 Agent 结论。只有 owner 明确需要 wrapper 级限制时，才在 `~/.config/agent-delegation/config.json` 中配置正整数 `max_task_chars` 或 `max_result_chars`；字段缺失表示不设字符上限。目标模型或传输层的真实上下文错误由对应层报告，并保留在结构化结果或 receipt 中。
+同一会话的 wrapper 调用自动等待前一项完成；取消等待中的调用不会取消正在执行的任务，不同独立任务仍可并行。等待计入时间预算。省略 `--session` 使用一次性会话。`--model` 透传明确选择的模型；省略时保留目标默认设置，不会继承调用方的模型或完整对话。
+
+运行时直接把 registry 中的 argv 传给 ACPX，项目或全局 alias 不会替换实际 executable。`doctor --to codex --json` 只检查指定目标并显示有效预算；旧版本探针是诊断信息，不再阻断健康目标。
+
+启动消息在 stderr 给出 receipt 路径。每次真实运行把以下私有收据写入 `~/.local/state/agent-delegation/runs/`：
+
+- `request.json`：边界、hash、启动 argv、会话与模型选择；不保存原始 task 文本；
+- `events.ndjson`：运行中持续落盘的 ACPX 事件，日志中的读取原文默认被抑制；
+- `stderr.log`：运行中持续落盘的诊断；
+- `result.json`：传输终态、stop reason、文本和原始内容块、会话身份、结构化错误和耗时。
+
+wrapper 默认不限制 task 或结果字符数。可选正整数 `max_task_chars` 限制输入，`max_result_chars` 只限制便于阅读的 `assistant_text` 字段；原始内容块和事件仍完整保留。配置在启动前校验，超时或取消保留已产生的部分结果。
+
+状态区分正常结束、取消、超时、权限拒绝、会话不存在、拒答、未完成和错误。`rpc_errors` 保留 method/code/data；`tool_errors` 标识普通工具错误；兼容字段 `protocol_errors` 排除已识别的普通客户端操作。读取不存在的可选文件不会自动把正常 `end_turn` 判为失败，正常结束也不等于业务结果已经通过验收。
 
 ## 权限边界
 
@@ -127,9 +145,9 @@ wrapper 默认不限制 task 或标准化结果的字符数，也不会在标准
 - `approve-reads`、`deny-all` 与 `--no-terminal` 是有意缩减能力时才使用的显式模式。例如需要限制时同时传 `--permissions approve-reads --no-terminal`；不要因为任务文字写了“只读”就顺手关闭 Agent 可能需要的 Shell 或网络。
 - ACPX 的 permission mode 无法理解任意命令的语义，也不要增加字符串 allowlist 假装能够判断。显式受限模式导致 permission failure 时，应把它作为真实 blocked 结果处理。
 - 发送、发布、部署、购买、交易、身份/权限变更、删除或凭据操作等 commit effect，只有在用户明确授权该具体动作和范围时才能随委派传递；否则只准备，不提交。
-- worker 拥有解法与探索自主权，但不能批准自己的副作用。transport exit `0` 只证明 ACP turn 完成；caller 按风险验证关键事实，不默认重做 worker 的工作。
+- worker 拥有解法与探索自主权，但不能批准自己的副作用。`success` 表示收到正常终态；仅有底层 exit `0` 而缺少终态时仍为 `incomplete`。caller 按风险验证关键事实，不默认重做 worker 的工作。
 - `cwd`、Prompt、ACPX mode 和 authorization note 都不是 OS 沙箱；如果目标能触达高风险外部系统或不可逆效果，必须使用真实宿主隔离或 tool-specific policy，或不把该能力交给本次委派。
-- 默认和最大单次 timeout 都是 7200 秒（2 小时）；只有显式传入更小的 `--timeout` 才会缩短。
+- 新安装的缺省 timeout 与最大值为 7200 秒，已有 registry 配置会保留；实际值以 `doctor` 为准。例如既有 43200 秒配置仍为 12 小时。`--timeout` 可在配置上限内选择，`--max-depth` 可降低继承的深度预算。
 
 ## 增加其他 ACP CLI
 
@@ -149,7 +167,7 @@ agent-delegate doctor --json
 
 ## 更新与移除
 
-更新 reviewed checkout 后重新运行 installer。它会保留未知的自定义 target 和 ACPX 其他配置，并备份被管理的文件。
+更新 reviewed checkout 后重新运行 installer。`--hosts kimi` 只安装该宿主 Skill 并配置 Kimi 目标，不依赖其他五个 CLI。可用 `--targets` 分别选择要配置的 ACP 目标，`--hosts none --targets none` 只安装共享 runtime。未选中的既有目标、自定义预算和其他 ACPX 配置会保留；被管理的文件有备份。
 
 ```bash
 python3 scripts/install_user.py uninstall
@@ -164,4 +182,11 @@ python3 scripts/install_user.py uninstall --remove-runtime
 python3 -m unittest discover -s tests -v
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" \
   plugins/agent-delegation/skills/agent-delegation
+```
+
+已有 pinned ACPX 时，可加跑真实传输回归。测试使用隔离的临时配置和本地 ACP 夹具，不调用模型或读取用户会话：
+
+```bash
+AGENT_DELEGATION_TEST_ACPX=/absolute/path/to/runtime/node_modules/.bin/acpx \
+  python3 -m unittest discover -s tests -p test_acpx_transport.py -v
 ```

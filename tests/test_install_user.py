@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,40 @@ SPEC.loader.exec_module(install_user)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_only_selected_target_cli_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            kimi = home / ".kimi-code/bin/kimi"
+            kimi.parent.mkdir(parents=True)
+            kimi.write_text("#!/bin/sh\necho fixture-kimi\n")
+            kimi.chmod(0o755)
+            targets = install_user._build_managed_targets(home, home / "runtime", ["kimi"])
+            self.assertEqual(set(targets), {"kimi"})
+            self.assertEqual(targets["kimi"]["argv"], [str(kimi), "acp"])
+            self.assertEqual(install_user._build_managed_targets(home, home / "runtime", []), {})
+
+    def test_stable_cli_symlink_is_not_resolved_to_retired_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            executable = home / "version-1"
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            stable = home / "current"
+            stable.symlink_to(executable)
+            self.assertEqual(install_user._resolve_executable(home, [stable], []), stable)
+
+    def test_zcode_adapter_keeps_existing_timeout_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            registry = home / ".config/agent-delegation/config.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(json.dumps({"max_timeout_seconds": 43200}))
+            with patch.object(install_user, "_resolve_executable", return_value=home / "cli"), \
+                 patch.object(install_user, "_version_line", return_value="fixture"), \
+                 patch.object(Path, "is_file", return_value=True):
+                argv = install_user._build_managed_targets(home, home / "runtime", ["zcode"])["zcode"]["argv"]
+            self.assertEqual(argv[argv.index("--prompt-timeout-secs") + 1], "43200")
+
     def test_host_destinations_are_native_user_paths(self) -> None:
         home = Path("/tmp/example-home")
         expected = {
@@ -64,7 +99,8 @@ class InstallerTests(unittest.TestCase):
                 "provenance": "test",
             }
             registry_path.write_text(
-                json.dumps({"schema_version": 1, "targets": {"custom": custom}}),
+                json.dumps({"schema_version": 1, "targets": {"custom": custom, "zcode": custom},
+                            "default_timeout_seconds": 43200, "max_timeout_seconds": 43200}),
                 encoding="utf-8",
             )
             acpx_path = home / ".acpx/config.json"
@@ -83,13 +119,14 @@ class InstallerTests(unittest.TestCase):
             _, registry, _ = install_user._merge_registry(home, runtime, managed, backup)
 
             self.assertEqual(registry["targets"]["custom"], custom)
+            self.assertEqual(registry["targets"]["zcode"], custom)
             self.assertEqual(registry["targets"]["hermes"], managed["hermes"])
             acpx = json.loads(acpx_path.read_text(encoding="utf-8"))
             self.assertEqual(acpx["auth"], {"kept": "redacted"})
             self.assertEqual(acpx["agents"]["custom"], {"argv": custom["argv"]})
             self.assertEqual(acpx["agents"]["hermes"], {"argv": managed["hermes"]["argv"]})
-            self.assertEqual(registry["default_timeout_seconds"], 7200)
-            self.assertEqual(registry["max_timeout_seconds"], 7200)
+            self.assertEqual(registry["default_timeout_seconds"], 43200)
+            self.assertEqual(registry["max_timeout_seconds"], 43200)
             self.assertEqual(acpx["defaultPermissions"], "approve-all")
             self.assertEqual(acpx["timeout"], 7200)
 
