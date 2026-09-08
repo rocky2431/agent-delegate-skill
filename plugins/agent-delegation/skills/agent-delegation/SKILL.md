@@ -7,6 +7,13 @@ description: Delegate missions between Hermes, Claude Code, Codex, Kimi, zCode, 
 
 Give the worker a mission, relevant context, existing authority, and a useful completion condition. Let it choose the reasoning, exploration, tools, and solution. Delegation is not limited to coding. A short prompt is enough; use [task-packet.md](references/task-packet.md) for a more involved handoff.
 
+This Skill is usable on its own. When continuing work from another Skill or agent,
+pass the existing result/specification and selected state record by accessible path,
+with the actual workspace, revision and necessary uncommitted artifacts. Preserve
+acceptance IDs and meanings, exclusions, prior failures, key corrections and granted
+authority. The worker reads those sources before reconstructing the task. No Task
+State, Deep Thinking or UltraGoal installation is required on either side.
+
 Use `agent-delegate list --json` if targets are unknown. Choose a target for its useful context, tools, or independent perspective; the same agent type can run another independent task.
 
 ## Submit and collect
@@ -73,6 +80,13 @@ Use `approve-reads`, `deny-all`, or `--no-terminal` only for an intentional capa
 ## Read the result
 
 The start message on stderr identifies a private receipt directory. Events and diagnostics are written there during execution. The final JSON includes the stop reason, text, content blocks, session identity, structured errors, and receipt path; partial output survives timeout and cancellation.
+
+Keep the delegation ID, terminal receipt and actual output references in the existing
+task record, if present; do not create a second progress ledger merely for dispatch.
+One designated writer integrates the worker's evidence into that record. Record the
+consumer's business verdict and its check separately from transport status. Use
+existing project document paths, or `documents/<work-id>/` for new business artifacts
+without a convention; keep private receipts in their existing runtime location.
 
 `success` means the ACP turn ended normally, not that the user's outcome is proven. Integrate the result and verify decision-critical claims proportionally. Tool errors such as a missing optional file do not automatically invalidate a completed turn. Inspect their details instead of requiring an empty error list or repeating all of the worker's work.
 
