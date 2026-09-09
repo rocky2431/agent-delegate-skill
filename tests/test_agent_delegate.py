@@ -10,6 +10,7 @@ import time
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -604,6 +605,124 @@ class AgentDelegateCliTests(unittest.TestCase):
             result = self.mission("--queue-timeout", seconds)
             self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse((self.root / "receipts").exists())
+
+    def test_default_wait_uses_worker_completion_and_survives_observer_interruption(self) -> None:
+        self.acpx.write_text("#!/usr/bin/env python3\nimport json,sys,time\nsys.stdin.read()\n"
+                             "time.sleep(1)\nprint(json.dumps({'result':{'stopReason':'end_turn'}}))\n")
+        task = json.loads(self.run_cli("submit", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        observer = subprocess.Popen([sys.executable, str(SCRIPT), "wait", "--id", task["delegation_id"]],
+                                    env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                observer.communicate(timeout=0.15)
+            observer.terminate()
+            observer.communicate(timeout=5)
+            spec = importlib.util.spec_from_file_location("event_wait", SCRIPT)
+            wrapper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(wrapper)
+            # Even a caller that forbids sleep/polling can wait for this real process.
+            with patch.object(wrapper.time, "sleep", side_effect=AssertionError("polling")):
+                result = wrapper._wait_for_task(Path(task["receipt_dir"]))
+            self.assertEqual(result["status"], "success")
+            self.assertNotIn("wait_timed_out", result)
+        finally:
+            if observer.poll() is None:
+                observer.kill()
+                observer.communicate()
+            self.run_cli("cancel", "--id", task["delegation_id"])
+
+    def test_finite_event_wait_expires_without_cancelling(self) -> None:
+        self.acpx.write_text("#!/usr/bin/env python3\nimport json,sys,time\nsys.stdin.read()\n"
+                             "time.sleep(1.4)\nprint(json.dumps({'result':{'stopReason':'end_turn'}}))\n")
+        task = json.loads(self.run_cli("submit", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        spec = importlib.util.spec_from_file_location("finite_wait", SCRIPT)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        with patch.object(wrapper.time, "sleep", side_effect=AssertionError("polling")):
+            snapshot = wrapper._wait_for_task(Path(task["receipt_dir"]), 0.1)
+        self.assertTrue(snapshot["wait_timed_out"])
+        self.assertFalse(snapshot["cancel_requested"])
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous_handler)
+        result = self.run_cli("wait", "--id", task["delegation_id"])
+        self.assertEqual(json.loads(result.stdout)["status"], "success")
+
+    def test_codex_completion_queues_once_and_retries_only_failed_delivery(self) -> None:
+        codex = self.bin / "codex"
+        calls = self.root / "queue-calls.jsonl"
+        fail = self.root / "fail-queue"
+        codex.write_text("#!/usr/bin/env python3\nimport json,pathlib,sys\n"
+                         "if sys.argv[1:]==['queue','--help']:\n print('--thread THREAD --message TEXT');sys.exit(0)\n"
+                         f"with open({str(calls)!r},'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                         f"sys.exit(7 if pathlib.Path({str(fail)!r}).exists() else 0)\n")
+        codex.chmod(0o755)
+        thread_id = "11111111-1111-4111-8111-111111111111"
+        env = {**self.environment, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
+               "CODEX_THREAD_ID": thread_id}
+        self.acpx.write_text("#!/usr/bin/env python3\nimport json,sys,time\nsys.stdin.read()\n"
+                             "time.sleep(.4)\nprint(json.dumps({'result':{'stopReason':'end_turn'}}))\n")
+        fail.touch()
+        submitted = self.run_cli("submit", "--to", "beta", "--caller", "codex", "--cwd", str(self.cwd),
+                                 "--task", "fixture", "--notify", "codex", environment=env)
+        self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        task = json.loads(submitted.stdout)
+        self.assertEqual(task["notification"]["thread_id"], thread_id)
+        self.assertFalse(calls.exists(), "submission must not send a completion message")
+        failed = self.run_cli("notify", "--id", task["delegation_id"], environment=env)
+        self.assertEqual(json.loads(failed.stdout)["status"], "failed", failed.stderr)
+        self.assertEqual(len(calls.read_text().splitlines()), 1)
+        fail.unlink()
+        # The saved origin wins over a later shell's session identity.
+        other_env = {**env, "CODEX_THREAD_ID": "22222222-2222-4222-8222-222222222222"}
+        result = self.run_cli("notify", "--id", task["delegation_id"], "--retry", environment=other_env)
+        self.assertEqual(json.loads(result.stdout)["status"], "queued", result.stderr)
+        for _ in range(2):
+            self.assertEqual(self.run_cli("notify", "--id", task["delegation_id"], "--retry", environment=other_env).returncode, 0)
+        records = [json.loads(line) for line in calls.read_text().splitlines()]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[1][0:3], ["queue", "--thread", thread_id])
+        self.assertIn(task["delegation_id"] + ":terminal", records[1][-1])
+        self.assertIn('"status": "success"', records[1][-1])
+
+    def test_codex_notification_rejects_missing_origin_before_submission(self) -> None:
+        env = {k: v for k, v in self.environment.items() if k != "CODEX_THREAD_ID"}
+        result = self.run_cli("submit", "--to", "beta", "--caller", "codex", "--cwd", str(self.cwd),
+                              "--task", "fixture", "--notify", "codex", environment=env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("CODEX_THREAD_ID", result.stderr)
+        result = self.run_cli("submit", "--to", "beta", "--caller", "zcode", "--cwd", str(self.cwd),
+                              "--task", "fixture", "--notify", "codex")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse((self.root / "receipts").exists())
+
+    def test_event_wait_reports_lost_worker_and_uncertain_notification_without_replay(self) -> None:
+        task_id = "a" * 32
+        receipt = self.root / "receipts" / ("test-" + task_id)
+        receipt.mkdir(parents=True)
+        (receipt / "worker.lock").touch()
+        (receipt / "request.json").write_text("{}")
+        (receipt / "state.json").write_text(json.dumps({"delegation_id": task_id, "status": "running",
+            "terminal": False, "created_monotonic": time.monotonic(), "receipt_dir": str(receipt)}))
+        (receipt / "notification.json").write_text(json.dumps({"status": "sending", "event_id": task_id + ":terminal"}))
+        result = self.run_cli("wait", "--id", task_id)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "incomplete", result.stderr)
+        self.assertEqual(payload["execution_state"], "unknown")
+        notification = self.run_cli("notify", "--id", task_id)
+        self.assertEqual(notification.returncode, 1, notification.stderr)
+        self.assertEqual(json.loads(notification.stdout)["status"], "unknown")
+
+    def test_completion_event_keeps_worker_content_in_the_original_receipt(self) -> None:
+        task = json.loads(self.run_cli("submit", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        result = self.run_cli("wait", "--id", task["delegation_id"], "--event")
+        event = json.loads(result.stdout)
+        self.assertEqual(event["event_id"], task["delegation_id"] + ":terminal")
+        self.assertTrue(event["terminal"])
+        self.assertEqual(event["status"], "success")
+        self.assertNotIn("assistant_text", event)
+        self.assertNotIn("delegated ok", result.stdout)
+        receipt = json.loads((Path(event["receipt_dir"]) / "result.json").read_text())
+        self.assertEqual(receipt["assistant_text"], "delegated ok")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -593,6 +594,8 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
 def _run(args: argparse.Namespace) -> int:
     registry, launch = _prepare_run(args)
     request, commands = launch["request"], launch["commands"]
+    if getattr(args, "notify", None):
+        request["notification"] = _notification_destination(request["caller"])
     if args.dry_run:
         print(json.dumps({**request, "status": "dry_run", "command": commands[-1][0],
                           "commands": [command for command, _ in commands]}, ensure_ascii=False, indent=2))
@@ -614,6 +617,11 @@ def _run(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "starting", "delegation_id": request["delegation_id"],
                           "receipt_dir": str(receipt_dir)}), file=sys.stderr, flush=True)
         if args.command == "submit":
+            if "notification" in request:
+                _atomic_write_json(receipt_dir / "notification.json", {
+                    **request["notification"], "event_id": request["delegation_id"] + ":terminal",
+                    "status": "pending",
+                })
             _atomic_write_json(receipt_dir / "launch.json", launch)
             with (receipt_dir / "worker.log").open("xb", buffering=0) as log:
                 os.chmod(log.name, 0o600)
@@ -625,7 +633,22 @@ def _run(args: argparse.Namespace) -> int:
                 except OSError:
                     (receipt_dir / "launch.json").unlink(missing_ok=True)
                     raise
-            print(json.dumps(_task_snapshot(receipt_dir), ensure_ascii=False, indent=2))
+            if "notification" in request:
+                with (receipt_dir / "notification.log").open("xb", buffering=0) as log:
+                    os.chmod(log.name, 0o600)
+                    try:
+                        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_notify",
+                                          "--receipt-dir", str(receipt_dir)],
+                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                         start_new_session=True)
+                    except OSError as exc:
+                        notification = _read_json_object(receipt_dir / "notification.json")
+                        _atomic_write_json(receipt_dir / "notification.json", {
+                            **notification, "status": "failed", "error": str(exc)})
+            snapshot = _task_snapshot(receipt_dir)
+            if "notification" in request:
+                snapshot["notification"] = _read_json_object(receipt_dir / "notification.json")
+            print(json.dumps(snapshot, ensure_ascii=False, indent=2))
             return 0
         return _execute_run(receipt_dir, launch)
 
@@ -821,6 +844,100 @@ def _task_snapshot(receipt_dir: Path) -> dict[str, Any]:
     return state
 
 
+def _wait_for_task(receipt_dir: Path, timeout: float | None = None) -> dict[str, Any]:
+    """Wait for the worker's ownership to end, without periodic status reads."""
+    result = _task_snapshot(receipt_dir)
+    if result["terminal"]:
+        return result
+    if timeout == 0:
+        return {**result, "wait_timed_out": True}
+
+    def expired(signum: int, frame: Any) -> None:
+        raise TimeoutError
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    try:
+        if timeout is not None:
+            signal.signal(signal.SIGALRM, expired)
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+        with (receipt_dir / "worker.lock").open("rb") as owner:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_SH)
+    except TimeoutError:
+        result = _task_snapshot(receipt_dir)
+        return result if result["terminal"] else {**result, "wait_timed_out": True}
+    finally:
+        if timeout is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+    return _task_snapshot(receipt_dir)
+
+
+def _notification_destination(caller: str) -> dict[str, Any]:
+    if caller != "codex":
+        raise DelegationError("--notify codex requires --caller codex in the originating Codex session.")
+    thread_id = os.environ.get("CODEX_THREAD_ID", "")
+    try:
+        if str(uuid.UUID(thread_id)) != thread_id:
+            raise ValueError
+    except ValueError as exc:
+        raise DelegationError("--notify codex requires the actual CODEX_THREAD_ID; do not invent a session ID.") from exc
+    executable = shutil.which("codex")
+    if not executable:
+        raise DelegationError("Codex CLI is unavailable for completion delivery.")
+    try:
+        probe = subprocess.run([executable, "queue", "--help"], text=True, capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        raise DelegationError("Codex queue capability probe timed out; no mission was submitted.") from exc
+    if probe.returncode or "--thread" not in probe.stdout:
+        raise DelegationError("This Codex CLI does not support queue; use a host-owned background wait.")
+    return {"host": "codex", "transport": "codex_queue", "thread_id": thread_id,
+            "executable": executable}
+
+
+def _notify_task(args: argparse.Namespace) -> int:
+    receipt_dir = Path(args.receipt_dir) if args.command == "_notify" else _task_receipt(args.id)
+    path = receipt_dir / "notification.json"
+    if not path.is_file():
+        raise DelegationError("This task has no notification destination; keep its original result and use wait.")
+    with (receipt_dir / "notification.lock").open("a+") as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        notification = _read_json_object(path)
+        status = notification["status"]
+        if status == "sending":
+            notification.update(status="unknown", error="Delivery was interrupted; inspect the host queue before retrying.")
+            _atomic_write_json(path, notification)
+            status = "unknown"
+        if status == "queued" or (status in ("failed", "unknown") and not getattr(args, "retry", False)):
+            print(json.dumps(notification, ensure_ascii=False, indent=2))
+            return 0 if status == "queued" else 1
+        result = _wait_for_task(receipt_dir)
+        event = {"event_id": notification["event_id"], "delegation_id": result["delegation_id"],
+                 "status": result["status"], "receipt_dir": str(receipt_dir)}
+        if "execution_state" in result:
+            event["execution_state"] = result["execution_state"]
+        message = ("External delegation result: " + json.dumps(event, ensure_ascii=False) +
+                   ". Read this task's receipt and integrate the result once per event_id. "
+                   "Wrapper completion is not business acceptance; unknown execution needs inspection before retrying.")
+        notification.update(status="sending", attempted_at=datetime.now(UTC).isoformat())
+        notification.pop("error", None)
+        _atomic_write_json(path, notification)
+        try:
+            delivered = subprocess.run([notification["executable"], "queue", "--thread",
+                                        notification["thread_id"], "--message", message],
+                                       text=True, capture_output=True, timeout=30)
+            notification.update(status="queued" if delivered.returncode == 0 else "failed",
+                                exit_code=delivered.returncode,
+                                response=(delivered.stdout + delivered.stderr).strip())
+        except subprocess.TimeoutExpired:
+            notification.update(status="unknown", error="Queue response timed out; inspect the host before retrying.")
+        except OSError as exc:
+            notification.update(status="failed", error=str(exc))
+        _atomic_write_json(path, notification)
+        print(json.dumps(notification, ensure_ascii=False, indent=2))
+        return 0 if notification["status"] == "queued" else 1
+
+
 def _observe_task(args: argparse.Namespace) -> int:
     receipt_dir = _task_receipt(args.id)
     if args.command == "cancel":
@@ -832,19 +949,17 @@ def _observe_task(args: argparse.Namespace) -> int:
                 "delegation_id": args.id, "requested_at": datetime.now(UTC).isoformat()})
             result = _task_snapshot(receipt_dir)
     else:
-        if args.command == "wait" and args.timeout < 0:
+        if args.command == "wait" and args.timeout is not None and args.timeout < 0:
             raise DelegationError("Wait timeout must be non-negative seconds.")
-        deadline = time.monotonic() + (args.timeout if args.command == "wait" else 0)
-        while True:
-            result = _task_snapshot(receipt_dir)
-            if args.command != "wait" or result["terminal"]:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                result["wait_timed_out"] = True
-                break
-            time.sleep(min(0.1, remaining))
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+        result = _wait_for_task(receipt_dir, args.timeout) if args.command == "wait" else _task_snapshot(receipt_dir)
+    if (receipt_dir / "notification.json").is_file():
+        result["notification"] = _read_json_object(receipt_dir / "notification.json")
+    output = result
+    if getattr(args, "event", False):
+        output = {key: result[key] for key in ("delegation_id", "terminal", "status", "receipt_dir",
+                                               "execution_state", "wait_timed_out") if key in result}
+        output["event_id"] = args.id + (":terminal" if result["terminal"] else ":observation")
+    print(json.dumps(output, ensure_ascii=False, indent=2))
     return _result_exit_code(result) if args.command == "wait" and result["terminal"] else 0
 
 
@@ -1167,6 +1282,9 @@ def _build_parser() -> argparse.ArgumentParser:
             help="Optional existing owner authority or prompt-boundary note stored in the receipt.",
         )
         run_parser.add_argument("--dry-run", action="store_true", help="Validate and print the launch plan only.")
+        if operation == "submit":
+            run_parser.add_argument("--notify", choices=["codex"],
+                                    help="Queue one completion message to the originating CODEX_THREAD_ID; queue acceptance is not proof of host wakeup.")
         run_parser.set_defaults(terminal=True, handler=_run)
 
     for operation in ("cancel", "close"):
@@ -1185,10 +1303,18 @@ def _build_parser() -> argparse.ArgumentParser:
     for operation in ("status", "wait"):
         observer = subparsers.add_parser(operation, help="Read task progress or result without owning its execution.")
         observer.add_argument("--id", required=True, help="Full delegation_id returned by run or submit.")
+        observer.add_argument("--event", action="store_true", help="Return a compact event and receipt path instead of the full worker output.")
         if operation == "wait":
-            observer.add_argument("--timeout", type=int, default=30,
-                                  help="Seconds to wait for a result; expiration never cancels the task (default: 30).")
+            observer.add_argument("--timeout", type=int,
+                                  help="Optional observation limit in seconds; default waits for completion. Zero reads once; expiry never cancels execution.")
         observer.set_defaults(handler=_observe_task)
+
+    for operation in ("notify", "_notify"):
+        notifier = subparsers.add_parser(operation, help="Deliver a saved task's completion to its original host queue.")
+        notifier.add_argument("--receipt-dir" if operation == "_notify" else "--id", required=True)
+        notifier.add_argument("--retry", action="store_true",
+                              help="Retry failed or uncertain delivery only after inspecting the original host queue.")
+        notifier.set_defaults(handler=_notify_task)
 
     register_parser = subparsers.add_parser("register", help="Register an additional reviewed ACP target.")
     register_parser.add_argument("--name", required=True)

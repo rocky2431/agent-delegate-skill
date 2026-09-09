@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.5.0。
+版本：0.6.0。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -127,18 +127,20 @@ agent-delegate submit \
   --task-file /absolute/path/to/mission.md
 ```
 
-保存返回的 `delegation_id`，再等待这项任务：
+保存返回的 `delegation_id`。在 CC 或 zCode 中，用原生后台 Bash（`run_in_background: true`）启动一次等待器，收到宿主完成通知后再读取结果：
 
 ```bash
-agent-delegate wait --id <delegation_id> --timeout 30
+agent-delegate wait --id <delegation_id>
 ```
+
+默认等待器阻塞在 worker 进程锁上，没有周期性状态查询。Codex 的交付方式和宿主限制见[完成通知说明](plugins/agent-delegation/skills/agent-delegation/references/operations.md#host-completion-delivery)。
 
 每次返回都要读取 JSON。命令退出码为零，不代表 mission 已经完成。
 
 | 返回状态 | 后续处理 |
 |---|---|
-| `terminal: false` | 保留 ID，稍后继续等待。任务仍在启动、排队或运行。 |
-| `wait_timed_out: true` | 只有本次等待结束，任务仍在继续。不要重复派发。 |
+| `terminal: false` | 保留 ID 和完成等待器，做独立工作或交还控制权。 |
+| `wait_timed_out: true` | 显式限时的诊断结束，任务仍在继续。保留完成通知，不启动模型轮询或重复派发。 |
 | `terminal: true`，`status: success` | 读取文本和内容块，再按风险核对重要结论。 |
 | `terminal: true`，其他状态 | 查看原因、部分输出和收据，再决定是否重试。 |
 
@@ -200,7 +202,7 @@ agent-delegate submit --to codex --cwd /absolute/path/to/project \
 |---|---|
 | `submit --timeout N` | 进入执行并完成 session setup 后开始计算的执行预算。 |
 | `submit --queue-timeout N` | 等待命名会话轮次的可选期限。 |
-| `wait --timeout N` | 本次观察等待多久。超时不会停止任务。 |
+| `wait --timeout N` | 可选诊断等待时限；省略则等待完成。超时不会停止任务。 |
 
 新安装的执行时间上限是 7200 秒，委派深度上限是 4。已有 registry 配置会保留。
 以下命令显示实际生效值：

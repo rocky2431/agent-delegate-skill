@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.5.0.
+Version: 0.6.0.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -154,19 +154,22 @@ agent-delegate submit \
   --task-file /absolute/path/to/mission.md
 ```
 
-Keep the returned `delegation_id`, then wait on that exact task:
+Keep the returned `delegation_id`. In Claude Code or zCode, run one observer using native background Bash (`run_in_background: true`), and collect it on the host completion notification:
 
 ```bash
-agent-delegate wait --id <delegation_id> --timeout 30
+agent-delegate wait --id <delegation_id>
 ```
+
+The default observer blocks on worker completion without periodic status reads.
+For Codex delivery and host limitations, see [host completion delivery](plugins/agent-delegation/skills/agent-delegation/references/operations.md#host-completion-delivery).
 
 Read the JSON on every return. A command exit code of zero does not mean the
 mission is complete.
 
 | Returned state | What to do |
 |---|---|
-| `terminal: false` | Keep the ID and wait again later. The task is starting, queued, or running. |
-| `wait_timed_out: true` | Only this observation ended. The task continues. Do not submit a duplicate. |
+| `terminal: false` | Keep the ID and completion observer; do independent work or yield. |
+| `wait_timed_out: true` | An explicitly bounded diagnostic ended. Keep completion delivery; do not start a model polling loop or submit a duplicate. |
 | `terminal: true`, `status: success` | Read the text and content blocks, then verify any decision-critical claim. |
 | `terminal: true`, another status | Inspect the reason, partial output, and receipt before retrying. |
 
@@ -231,7 +234,7 @@ The three timeout options control different clocks:
 |---|---|
 | `submit --timeout N` | Execution budget after queue admission and session setup. |
 | `submit --queue-timeout N` | Optional limit on waiting for a named-session turn. |
-| `wait --timeout N` | How long this observer waits. Expiry never stops the task. |
+| `wait --timeout N` | Optional diagnostic duration; omitted waits for completion. Expiry never stops the task. |
 
 Fresh installations use a 7200-second execution limit and delegation depth 4.
 Existing registry values are preserved. Check the effective values with:

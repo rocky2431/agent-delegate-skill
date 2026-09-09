@@ -34,8 +34,10 @@ content. All configured limits are validated before the worker starts.
 
 `submit` starts a task-owned background wrapper and returns its `delegation_id`.
 `status --id <delegation_id>` reads its current snapshot or final result.
-`wait --id <delegation_id> --timeout 30` waits up to 30 seconds for a final result;
-zero requests an immediate snapshot. On expiry it returns `terminal: false` and
+`wait --id <delegation_id>` blocks on the worker's ownership lock until it exits,
+then reads the final receipt (or reports lost ownership). No timer wakes the model
+and no repeated file reads are needed. An optional `--timeout N` bounds one
+diagnostic observation; zero requests an immediate snapshot. On expiry it returns `terminal: false` and
 `wait_timed_out: true`, without cancelling execution. Interrupting the observer
 also leaves the submitted task running. Reuse the same ID to collect its result.
 
@@ -47,7 +49,7 @@ A `wait` that returns a final result uses the task's outcome as its exit code.
 |---|---|
 | `submit --timeout N` (also `run`) | Execution budget in seconds, after queue admission and named-session setup. Defaults to the registry value. |
 | `submit --queue-timeout N` (also `run`) | Optional positive limit on waiting for the wrapper session lock. Expiry ends only this waiting task. Omitted means no queue deadline. |
-| `wait --timeout N` | Nonnegative observation duration, default 30 seconds. Expiry never stops execution. |
+| `wait --timeout N` | Optional nonnegative observation duration. Omitted means wait for completion. Expiry never stops execution. |
 
 Named-session setup has its own bounded attempt and does not subtract from the
 execution budget. Receipts expose `queue_wait_seconds`, `execution_seconds`,
@@ -59,6 +61,148 @@ wall-clock duration exceed the requested execution budget.
 the invoking process and returns the final JSON. Use it when synchronous execution
 is specifically useful and the host can keep that process alive. Interrupting
 `run` can stop its task; it does not have `wait`'s observer-only semantics.
+
+## Host completion delivery
+
+The originating host owns result delivery. The execution target may be any
+registered external ACP agent; no native subagent routing is involved.
+
+### Claude Code and zCode
+
+Submit once. Start `agent-delegate wait --id <delegation_id>` through the host's
+native Bash tool with `run_in_background: true`. Keep both the delegation ID and
+the host's background-task ID. The waiter remains attached to that background
+task and exits only when the real worker ends. Do not add `&`, detach the waiter,
+or background only `submit`: those report the launcher's exit rather than the
+mission's outcome. Let the host's task notification trigger collection; read the
+output after that event, not on a timer.
+
+When a host tears down its background tasks, the observer can end while the
+submitted mission continues. Keep the delegation ID for later recovery. An output
+notification about a killed observer does not prove the mission stopped.
+
+CC's `asyncRewake` command hooks can also wake an idle session on exit code 2;
+ordinary `async` hooks only deliver on a subsequent turn. Native background Bash
+already covers ordinary delegation, so no global hook is installed here. zCode's
+native background task notification similarly avoids a global hook.
+
+### Codex
+
+Background process execution and starting a model turn are separate capabilities.
+The official App Server interface documents `process/outputDelta` and
+`process/exited` for client-owned processes, and `turn/start` with `toolOutput` to
+start a turn from an external result. A client already connected to the server
+owning the originating thread can await `agent-delegate wait --id <id> --event`
+and deliver that compact event through `turn/start`. Use the actual thread ID;
+retain its receipt and event ID for recovery and deduplication. The existing
+external worker and blocking observer are sufficient; a new process-control
+system is not required.
+
+This is a documented client integration path, not an installed Desktop adapter.
+Confirm the authorized connection to the server that owns this thread before
+claiming it works. Starting an unrelated app-server or resuming the same saved
+thread under another owner does not establish delivery to the current session.
+
+**The local code-runner callback failed idle acceptance.** On Desktop 26.903.61454
+with bundled Codex 0.153.4, a five-minute external Pi mission completed at
+2026-09-09 16:33:01 UTC. The `functions.exec` watcher did not issue its callback
+until 16:41:14, after a user message started a turn at 16:41:10. A surviving cell
+and successful `send_message_to_thread` call during an active turn do not prove
+independent execution after the parent final response. Do not use that recipe
+for unattended wakeup. Keep one attached wait when the host can leave the turn
+active without repeated model calls; otherwise retain the ID and report pending
+delivery. Do not emulate a callback with repeated `functions.wait` or status calls.
+
+Official interfaces: [process events](https://learn.chatgpt.com/docs/app-server#process-execution),
+[starting a turn with tool output](https://learn.chatgpt.com/docs/app-server#start-a-turn).
+
+For Codex hosts that consume their persistent message queue (including the
+Desktop version verified below):
+
+```bash
+agent-delegate submit --caller codex --notify codex --to zcode \
+  --cwd /absolute/task/root --task-file /absolute/mission.md
+```
+
+The optional CLI path captures the actual `CODEX_THREAD_ID` and available `codex` executable at
+submission. A separate observer waits on the existing worker lock and invokes
+`codex queue --thread <original-id> --message <completion-event>` once. It also
+reports a worker that exited without a result as `incomplete` / unknown execution.
+Worker termination releases the OS lock; no completion-file polling is required.
+
+`notification.json` tracks `pending`, `sending`, `queued`, `failed`, or `unknown`.
+The event contains a stable `event_id`, delegation ID, wrapper outcome and receipt
+path; it does not copy the worker's conversation into the parent. Delivery is
+serialized per task. A repeated `notify` does not enqueue an already queued event.
+The recipient should integrate each `event_id` once in its existing task record.
+
+**Queue acceptance is not automatic wakeup.** Some hosts may only drain queued
+input at a later user turn. Verify an idle-session probe in the actual Codex host
+before relying on unattended continuation. On 2026-09-09, Desktop 26.903.61454
+with Codex 0.153.4 passed an isolated idle probe through this independent CLI
+notifier. The parent turn ended at 17:03:26 UTC; Pi finished one `sleep 300` and
+returned `PI_IDLE_R2_OK` at 17:06:11.195. The notifier attempted enqueueing at
+17:06:11.222, and the completion event started a new turn in the original thread
+at 17:06:13. No intervening user turn or scheduled run occurred. Delegation
+`6b6350c9e2b14717a7f1d3222ef0b4b8` took 306.91 execution seconds and ended with a
+verified native Pi stop. This establishes idle delivery for that configuration,
+not every Codex host or recovery after an app restart.
+
+Codex ordinary async hooks do not start a new turn. Do not repeatedly call
+`wait`, use timer prompts, or spawn a new Codex
+session to disguise this capability gap. Keep the receipt and recover on the next
+user turn if this host does not drain the queue.
+
+Inspect `status --id <delegation_id>` when diagnosing delivery; it includes the
+notification state. To complete a saved pending notification, or retry a known
+failed delivery after correcting its cause:
+
+```bash
+agent-delegate notify --id <delegation_id>
+agent-delegate notify --id <delegation_id> --retry
+```
+
+Both commands retain the saved destination even if invoked from another shell.
+A timeout or a crash during `sending` is `unknown`: the queue may have accepted
+the event. Inspect the original queue before an explicit retry. There is no
+automatic retry of uncertain delivery and no claim of exactly-once handling
+across process failure. Task execution is never resubmitted by notification recovery.
+
+Native references checked 2026-09-09:
+[Claude background Bash](https://code.claude.com/docs/en/interactive-mode#background-bash-commands),
+[Claude hooks](https://code.claude.com/docs/en/hooks#run-hooks-in-the-background),
+[Codex async hooks](https://learn.chatgpt.com/docs/hooks#run-hooks-in-the-background).
+The local `codex queue --help` exposes the queue command. The installed zCode
+runtime exposes background Bash, completion-notification enqueueing and task IDs;
+runtime presence alone is not end-to-end host acceptance.
+
+Observed host checks on 2026-09-09: the independent Codex queue notifier passed
+idle wakeup. The earlier five-minute Pi test rejected the code-runner recipe as
+an idle wakeup mechanism. Earlier code-runner cross-turn delivery was confounded by another message
+opening the receiving turn first. CC 2.1.266 emitted a native `task_notification`
+and automatically continued after its background observer completed. The zCode
+0.16.5 live check stopped at provider quota error 429 / 1310 before tool execution,
+so its delivery remains unverified. The first ten-minute interval heartbeat had
+no recorded last run before the owner returned. A second, fixed-time one-run
+heartbeat was scheduled for 17:11:04 UTC and independently started the original
+thread at 17:11:17, after the callback-handling turn had ended at 17:09:56.
+Its saved `last_run_at` was 17:11:17.218, 13.218 seconds after the due time.
+It was then paused, with no next run. The callback and fixed-time fallback both
+passed separately in this experiment; the original interval blocker remains
+undetermined.
+These checks separate host delivery from the external worker's business outcome.
+
+For an explicitly requested callback experiment, a scheduled fallback is a separate
+delivery channel with its own acceptance. Local Desktop source inspection found
+that the notification policy affects completion notifications, not whether a run
+starts. Interval heartbeats calculate their next eligible time from recent thread
+activity and may defer for a busy thread or an input draft. A fixed-time, one-run
+fallback avoids that interval calculation, but still requires the host scheduler
+to run. Verify the actual scheduled timestamp, heartbeat `last_run_at`, and
+receiving turn. The successful heartbeat above created no `automation_runs` row;
+that table alone cannot establish whether a heartbeat ran. Saving the
+automation or selecting important updates proves neither. Do not treat an idle
+callback as accepted if a fallback or user message opened the receiving turn first.
 
 ## Sessions and cancellation
 
@@ -134,6 +278,8 @@ Each `run`, `submit`, or native session control creates a private directory unde
   adapter launch PID/time. Named sessions reuse the startup record under
   `.session-locks/`; the final receipt gets its own copy. `observation` distinguishes
   `adapter_launch`, `legacy_session_unverified`, and `launch_unobserved`.
+- `notification.json`, `notification.log`, `notification.lock`: optional Codex
+  completion destination, delivery state, diagnostics, and duplicate-send lock.
 
 Task-ID `status`, `wait`, and `cancel` reuse this receipt instead of creating new
 tasks. Cancellation writes a task-specific request for the owning wrapper; it does
