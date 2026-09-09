@@ -16,7 +16,7 @@ State, Deep Thinking or UltraGoal installation is required on either side.
 
 Use `agent-delegate list --json` if targets are unknown. Choose a target for its useful context, tools, or independent perspective; the same agent type can run another independent task.
 
-## Submit and collect
+## Submit and receive
 
 For ordinary delegation, submit once and keep the returned `delegation_id` with the task it identifies:
 
@@ -25,18 +25,43 @@ agent-delegate submit --to codex \
   --cwd /absolute/task/root --task-file /absolute/mission.md
 ```
 
-Then wait using that full ID. Replace `<delegation_id>` with the returned value:
+Choose completion delivery by the **originating host**, independently of `--to`.
+This Skill handles external ACP missions only.
+
+- **Codex:** use `submit --caller codex --notify codex` when this host consumes
+  its native message queue. Its independent observer sends one completion event
+  to the captured originating thread. This route passed a five-minute Pi mission
+  and idle wakeup on Desktop 26.903.61454; verify the consumer on other hosts.
+  A `functions.exec` watcher plus `send_message_to_thread` failed the same idle
+  requirement: it sent only after the next user turn. Do not treat code-cell
+  persistence as independent execution. A connected App Server client can also
+  deliver through `turn/start` with `toolOutput`. If neither route is available,
+  keep one attached wait while the host holds the turn active, or report pending
+  delivery and recover on the next user turn. Do not use model polling.
+  See [host delivery and observed limits](references/operations.md#codex).
+- **Claude Code / zCode:** submit once, then run the following `wait` command once
+  using the host's native background Bash tool (`run_in_background: true`). The
+  host reports the observer's completion; read its result then. Backgrounding
+  `submit` alone reports submission, not mission completion. Do not poll TaskOutput
+  or repeatedly read its output file while waiting.
+- **Other hosts:** use a native background completion notification when available,
+  or one attached wait when the host can keep it alive. Without a wake facility,
+  retain the ID and report that limitation; do not emulate one with timed model turns.
+
+The observer waits until this task completes or its worker is lost. It blocks on
+the existing worker lock, without periodic status reads. Replace `<delegation_id>`
+with the returned full ID:
 
 ```bash
-agent-delegate wait --id <delegation_id> --timeout 30
+agent-delegate wait --id <delegation_id>
 ```
 
 Read the JSON on every return; a successful command exit is not task completion.
 
 | Returned state | Next action |
 |---|---|
-| `terminal: false` (`starting`, `queued`, or `running`) | Keep this ID. Wait again, or do independent work and return to it. |
-| `wait_timed_out: true` | Only this observation ended; the task continues. Wait again on the same ID. Do not resubmit or cancel because a wait expired. |
+| `terminal: false` (`starting`, `queued`, or `running`) | Keep this ID and the completion observer. Do independent work or yield. |
+| `wait_timed_out: true` | An explicitly bounded observation ended; the task continues. Keep its completion delivery, or arrange one background wait on this ID. Do not create a repeated model wait loop, resubmit, or cancel because an observation expired. |
 | `terminal: true`, `status: success` | Read `assistant_text` and `assistant_content`, integrate the result, and verify decision-critical claims proportionally. |
 | `terminal: true`, another status | Inspect the reason, partial output, and receipt before deciding how to recover. `incomplete` or `execution_state: unknown` needs inspection before retrying; the worker may have performed effects. |
 
@@ -51,7 +76,11 @@ observation; it does not establish that the native task stopped.
 
 `status --id <delegation_id>` reads progress immediately and retrieves the same full result after completion. If a submit response is lost, recover the ID from its stderr receipt or saved request before submitting again. If the host interrupts a `wait`, resume observation with the same ID; the submitted task runs independently of that observer.
 
-The timeouts have different meanings: `wait --timeout` limits one observation; `submit --timeout` limits execution, excluding queue wait and session setup. Omit the execution override to use the configured budget. Add `--queue-timeout` only when the task needs a queue deadline; by default it waits for admission or cancellation.
+The timeouts have different meanings: optional `wait --timeout` limits one diagnostic
+observation (zero reads once); without it, observation waits for completion.
+`submit --timeout` limits execution, excluding queue wait and session setup. Omit
+the execution override to use the configured budget. Add `--queue-timeout` only
+when the task needs a queue deadline; by default it waits for admission or cancellation.
 
 ## Follow up or cancel when needed
 
