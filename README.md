@@ -377,3 +377,50 @@ AGENT_DELEGATION_TEST_ACPX=/absolute/path/to/runtime/node_modules/.bin/acpx \
 
 The tests use isolated temporary configuration and local ACP fixtures. They do
 not call a model or read user sessions.
+
+## 编程消费入口（acpx_delegate_entry）
+
+`runtime/acpx_delegate_entry.cjs` 是面向需要自持权限判定的工作流插件（例如 Ultra Builder Pro
+的委派执行边界）的薄公共入口。入口本身不携带任何策略：
+
+- 传输 permission mode 强制 `deny-all`：callback 抛错、超时或未返回决定时回退到 mode，
+  结果是拒绝而非放权（fail-closed）。
+- 权限请求只转发原始 `RequestPermissionRequest`（session id 与 toolCall 的 kind/locations/
+  options）；调用方决定必须指明请求中真实存在的 optionId，入口按该 option 的 kind 映射
+  ACP outcome，pinned runtime 再选该 kind 的第一项（与当前 UBP driver 相同），因此保证的是
+  kind 级语义而非任意重复 option 的精确 optionId；绝不把 `allow_once` 升级为 `allow_always`，
+  未知/缺失决定一律 `reject_once`。
+- 会话记录只存在本进程内存（含 runtime 并入 record 的环境视图），不写任何 transcript、
+  session record 或 env 值；不向 runtime 传 sessionOptions.env。
+- 协议协商是观测而非假设：pinned runtime 把 initialize 结果的 protocolVersion 写入公开
+  session record，并在 `ensureSession` 等待期间通过 session store 落盘该记录，因此 store
+  是实际协商版本唯一的公开观测点。除非实际观测到 stable protocol v1，入口在任何 turn 开始前
+  以类型化 `unsupported_protocol_version` 失败拒绝（`phase: ensure_session`）。pinned manager
+  在该记录持久化之前就已创建 agent 会话，所以拒绝时会话可能已存在，但绝不提交 prompt、工具
+  调用或模型 turn；result 行携带观测到的版本，未观测到（例如初始化失败）则完全省略该字段。
+- 取消是请求：SIGTERM/SIGINT 在 prompt 提交前即锁存取消（初始化期间到达的取消优先于
+  随后的 prompt），并有界等待终局，adapter 关闭仍执行；完整 writer 停止证明仍归调用方。
+
+协议为 stdio 按行 JSON（详见入口文件头注释）：一行 `acpx-delegate-turn-request/v1` 请求进，
+`started`/`event`/`permission_request`/`result` 行出（`result` 行在观测到协商版本时附带
+`protocolVersion` 兄弟字段，永不为常量）。失败结果的 `error` 带可选结构化 `phase`：
+仅当 turn 在 `runtime.startTurn` 从未被调用前被拒绝时为 `ensure_session`
+（ensureSession 失败，或入口自身的 unsupported/unproven 协议版本拒绝；prompt 未提交），
+到达 startTurn 边界后为 `turn`（工具可能已执行，writer 停止本身不构成
+重放安全证明）；phase 不从错误文本推断，缺失或未知不代表 before-prompt 证明。
+
+安装与发现契约：installer 把 reviewed 入口交付到当前选中 runtime 根目录内的
+`acpx_delegate_entry.cjs`，并在 registry（`~/.config/agent-delegation/config.json`）写入绝对路径
+键 `acpx_delegate_entry`——编程消费者（如 UBP）只读该键取入口路径。入口与选中 SDK 同目录，
+Node 从入口所在目录向上把 `require('acpx/runtime')` 解析到 `<runtime_root>/node_modules/acpx`；
+SDK 身份见 registry 的 `runtime_root`/`runtime_packages`。普通 Skill 更新只刷新该入口文件
+（字节相同则不重写、不备份），不运行 npm，也不触碰 `package.json`/`package-lock.json`/
+`node_modules`；`--update-runtime` 在 `runtimes/` 的新代目录交付当前 reviewed 入口并切换
+registry，旧代目录（含其入口与 SDK）原样保留。各新代目录的 `.agent-delegation-managed.json`
+记录 `runtime_packages`、`runtime_lock_sha256` 与 `runtime_entry_sha256`。对已安装选中
+runtime 的回归：
+
+```bash
+AGENT_DELEGATION_TEST_RUNTIME=/absolute/path/to/installed/runtime \
+  python3 -m unittest discover -s tests -p test_acpx_delegate_entry.py -v
+```

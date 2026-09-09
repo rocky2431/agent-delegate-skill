@@ -28,6 +28,7 @@ SKILL_SOURCE = (
     / "skills"
     / "agent-delegation"
 )
+DELEGATE_ENTRY_SOURCE = REPO_ROOT / "runtime" / "acpx_delegate_entry.cjs"
 HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode", "pi")
 RUNTIME_PACKAGES = ("acpx", "@agentclientprotocol/claude-agent-acp", "@agentclientprotocol/codex-acp")
 LEGACY_DEFAULT_CHAR_LIMITS = {
@@ -235,6 +236,19 @@ def _runtime_versions(runtime_root: Path) -> dict[str, str]:
     return versions
 
 
+def _install_delegate_entry(runtime_root: Path, backup: Path) -> Path:
+    """Deliver the reviewed public delegate entry beside the selected runtime's SDK."""
+    if not DELEGATE_ENTRY_SOURCE.is_file():
+        raise InstallError(f"Missing reviewed delegate entry {DELEGATE_ENTRY_SOURCE}.")
+    entry = runtime_root / DELEGATE_ENTRY_SOURCE.name
+    if entry.exists():
+        if _sha256(entry) == _sha256(DELEGATE_ENTRY_SOURCE):
+            return entry
+        _backup_item(entry, backup / "runtime" / entry.name)
+    _atomic_write_text(entry, DELEGATE_ENTRY_SOURCE.read_text(encoding="utf-8"), 0o644)
+    return entry
+
+
 def _install_runtime(home: Path, backup: Path, replace_existing: bool,
                      update_runtime: bool = False) -> tuple[Path, Path]:
     share_root = home / ".local" / "share" / "agent-delegation"
@@ -248,6 +262,8 @@ def _install_runtime(home: Path, backup: Path, replace_existing: bool,
     if existing_root.is_dir() and not update_runtime:
         # Skill updates never run npm against an existing runtime, even when it is
         # incomplete. An explicit update stages a replacement without touching it.
+        # The reviewed delegate entry still refreshes beside the selected SDK.
+        _install_delegate_entry(existing_root, backup)
         return share_root, existing_root
     for name in ("package.json", "package-lock.json"):
         existing = existing_root / name
@@ -283,10 +299,12 @@ def _install_runtime(home: Path, backup: Path, replace_existing: bool,
             raise InstallError(f"Runtime update failed; the previous runtime is unchanged:\n{completed.stderr[-4000:]}")
         versions = _runtime_versions(runtime_root)
         _version_line([str(runtime_root / "node_modules/.bin/acpx"), "--version"])
+        entry = _install_delegate_entry(runtime_root, backup)
         _atomic_write_json(runtime_root / ".agent-delegation-managed.json", {
             "package": "agent-delegation", "installed_at": datetime.now(UTC).isoformat(),
             "runtime_packages": versions,
             "runtime_lock_sha256": _sha256(runtime_root / "package-lock.json"),
+            "runtime_entry_sha256": _sha256(entry),
         })
     except BaseException:
         shutil.rmtree(runtime_root)
@@ -384,6 +402,7 @@ def _merge_registry(
             "schema_version": 1,
             "acpx_path": str((runtime_root / "node_modules" / ".bin" / "acpx").resolve()),
             "acpx_config_path": str(acpx_path),
+            "acpx_delegate_entry": str((runtime_root / "acpx_delegate_entry.cjs").resolve()),
             "runtime_root": str(runtime_root),
             "runtime_packages": _runtime_versions(runtime_root),
             "runtime_lock_sha256": _sha256(runtime_root / "package-lock.json"),

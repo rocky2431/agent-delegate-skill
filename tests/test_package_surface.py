@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -75,6 +76,14 @@ class PackageSurfaceTests(unittest.TestCase):
             lock_key = f"node_modules/{name}"
             self.assertEqual(lock["packages"][lock_key]["version"], version)
             self.assertEqual(lock["packages"][lock_key]["integrity"], integrity)
+
+    def test_public_delegate_entry_source_is_the_accepted_pin(self) -> None:
+        entry = REPO_ROOT / "runtime/acpx_delegate_entry.cjs"
+        self.assertTrue(entry.is_file())
+        self.assertEqual(
+            hashlib.sha256(entry.read_bytes()).hexdigest(),
+            "f734ed38cce00f14aa3229a6b21f8c7a452d6f7c2ef46f6b362907ba6aacecbd",
+        )
 
     def test_skill_is_generic_and_has_no_unfinished_scaffold(self) -> None:
         text = (

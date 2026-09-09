@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -201,6 +203,126 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(registry["runtime_packages"], {name: "1.2.3" for name in install_user.RUNTIME_PACKAGES})
             self.assertEqual(acpx["defaultPermissions"], "approve-all")
             self.assertEqual(acpx["timeout"], 7200)
+
+    def test_initial_install_delivers_delegate_entry_beside_the_selected_sdk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+
+            def install(argv, **kwargs):
+                self.write_runtime(kwargs["cwd"], "0.13.2")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with patch.object(install_user, "_version_line", return_value="v24.0.0"), \
+                 patch.object(install_user.subprocess, "run", side_effect=install):
+                _, runtime_root = install_user._install_runtime(home, home / "backup", False)
+            entry = runtime_root / "acpx_delegate_entry.cjs"
+            self.assertEqual(entry.read_bytes(), install_user.DELEGATE_ENTRY_SOURCE.read_bytes())
+            # The entry resolves require('acpx/runtime') from its own node_modules.
+            self.assertTrue((runtime_root / "node_modules/acpx/package.json").is_file())
+            marker = json.loads((runtime_root / ".agent-delegation-managed.json").read_text())
+            self.assertEqual(marker["runtime_entry_sha256"], install_user._sha256(entry))
+            self.assertEqual(marker["runtime_packages"]["acpx"], "0.13.2")
+
+    def test_skill_update_refreshes_only_the_delegate_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            share = home / ".local/share/agent-delegation"
+            old = share / "runtime"
+            self.write_runtime(old)
+            (share / ".managed.json").write_text('{"package":"agent-delegation"}')
+            registry_path = home / ".config/agent-delegation/config.json"
+            registry_path.parent.mkdir(parents=True)
+            registry_path.write_text(json.dumps({"runtime_root": str(old)}))
+            registry_before = registry_path.read_bytes()
+            lock_before = (old / "package-lock.json").read_bytes()
+            stale = old / "acpx_delegate_entry.cjs"
+            stale.write_text("// stale entry from an older source checkout\n")
+            with patch.object(install_user.subprocess, "run") as npm:
+                self.assertEqual(install_user._install_runtime(home, home / "backup", False), (share, old))
+                npm.assert_not_called()
+            self.assertEqual(stale.read_bytes(), install_user.DELEGATE_ENTRY_SOURCE.read_bytes())
+            self.assertEqual(
+                (home / "backup/runtime/acpx_delegate_entry.cjs").read_text(),
+                "// stale entry from an older source checkout\n",
+            )
+            self.assertEqual((old / "package-lock.json").read_bytes(), lock_before)
+            self.assertEqual(registry_path.read_bytes(), registry_before)
+            # A byte-identical entry is left alone: no rewrite, no extra backup.
+            with patch.object(install_user.subprocess, "run") as npm:
+                install_user._install_runtime(home, home / "backup-second", False)
+                npm.assert_not_called()
+            self.assertFalse((home / "backup-second/runtime/acpx_delegate_entry.cjs").exists())
+
+    def test_runtime_upgrade_delivers_the_entry_into_the_new_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            share = home / ".local/share/agent-delegation"
+            old = share / "runtime"
+            self.write_runtime(old)
+            (share / ".managed.json").write_text('{"package":"agent-delegation"}')
+            registry_path = home / ".config/agent-delegation/config.json"
+            registry_path.parent.mkdir(parents=True)
+            registry_path.write_text(json.dumps({"runtime_root": str(old)}))
+            old_entry = old / "acpx_delegate_entry.cjs"
+            old_entry.write_text("// previous generation entry\n")
+
+            def install(argv, **kwargs):
+                self.write_runtime(kwargs["cwd"], "2.0.0")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with patch.object(install_user, "_version_line", return_value="v24.0.0"), \
+                 patch.object(install_user.subprocess, "run", side_effect=install):
+                _, new = install_user._install_runtime(home, home / "backup", False, update_runtime=True)
+            self.assertNotEqual(new, old)
+            self.assertEqual(
+                (new / "acpx_delegate_entry.cjs").read_bytes(),
+                install_user.DELEGATE_ENTRY_SOURCE.read_bytes(),
+            )
+            marker = json.loads((new / ".agent-delegation-managed.json").read_text())
+            self.assertEqual(
+                marker["runtime_entry_sha256"], install_user._sha256(new / "acpx_delegate_entry.cjs"))
+            # The retired generation keeps its own entry and SDK untouched.
+            self.assertEqual(old_entry.read_text(), "// previous generation entry\n")
+
+    def test_registry_records_the_installed_delegate_entry_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            runtime = home / "runtime"
+            self.write_runtime(runtime)
+            entry = runtime / "acpx_delegate_entry.cjs"
+            entry.write_bytes(install_user.DELEGATE_ENTRY_SOURCE.read_bytes())
+            backup = home / "backup"
+            backup.mkdir()
+            _, registry, _ = install_user._merge_registry(home, runtime, {}, backup)
+            discovered = Path(registry["acpx_delegate_entry"])
+            self.assertEqual(discovered, entry.resolve())
+            self.assertTrue(discovered.is_file())
+            self.assertEqual(discovered.parent, Path(registry["runtime_root"]).resolve())
+
+    def test_install_runtime_only_delivers_the_discoverable_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            args = install_user.argparse.Namespace(
+                home=str(home), hosts="none", targets=None,
+                replace_existing=False, update_runtime=False,
+            )
+
+            def install(argv, **kwargs):
+                self.write_runtime(kwargs["cwd"], "0.13.2")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with patch.object(install_user, "_version_line", return_value="v24.0.0"), \
+                 patch.object(install_user.subprocess, "run", side_effect=install), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(install_user._install(args), 0)
+            registry = json.loads(
+                (home / ".config/agent-delegation/config.json").read_text(encoding="utf-8"))
+            discovered = Path(registry["acpx_delegate_entry"])
+            self.assertTrue(discovered.is_file())
+            self.assertEqual(discovered.read_bytes(), install_user.DELEGATE_ENTRY_SOURCE.read_bytes())
+            # The discovered entry sits beside the selected runtime's installed SDK.
+            self.assertEqual(discovered.parent, Path(registry["runtime_root"]).resolve())
+            self.assertEqual(install_user._runtime_versions(discovered.parent)["acpx"], "0.13.2")
 
 
 class KimiHomeTests(unittest.TestCase):
