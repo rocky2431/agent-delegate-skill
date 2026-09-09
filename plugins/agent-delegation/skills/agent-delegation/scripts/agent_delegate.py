@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -159,7 +159,7 @@ def _validate_target_record(name: object, target: object) -> None:
                 not all(isinstance(item, str) and item for item in value) or not Path(value[0]).is_absolute()):
             raise DelegationError(f"Target {name!r} launch commands must have an absolute executable.")
     cli_env = target.get("cli_env", {})
-    if not isinstance(cli_env, dict) or any(key not in ("CODEX_PATH", "CLAUDE_CODE_EXECUTABLE") or
+    if not isinstance(cli_env, dict) or any(key not in ("CODEX_PATH", "CLAUDE_CODE_EXECUTABLE", "PI_ACP_PI_COMMAND") or
             not isinstance(value, str) or not Path(value).is_absolute() for key, value in cli_env.items()):
         raise DelegationError(f"Target {name!r} cli_env must bind native CLI variables to absolute paths.")
 
@@ -356,6 +356,8 @@ def _result_status(code: int, parsed: dict[str, Any], interrupted: str | None, c
         return "success" if parsed.get("action") else "incomplete"
     if stop == "end_turn":
         return "success"
+    if stop == "error":
+        return "error"
     if stop == "refusal":
         return "refused"
     return "error" if parsed["protocol_errors"] and not stop else "incomplete"
@@ -506,6 +508,8 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
     _, registry = _load_registry()
     target = _target(registry, args.to)
     control = args.command in ("cancel", "close")
+    if not control and target.get("native_local_tools") and (args.permissions != "approve-all" or not args.terminal):
+        raise DelegationError("This target executes tools locally; ACP permission restrictions and --no-terminal cannot be enforced.")
     caller = (args.caller or os.environ.get("AGENT_DELEGATION_CALLER") or "unknown").strip()
     if not caller or "," in caller:
         raise DelegationError("Caller must be a non-empty label without commas.")
@@ -731,6 +735,9 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
         queue_wait = time.monotonic() - started
     with (receipt_dir / "events.ndjson").open(encoding="utf-8", errors="replace") as events:
         parsed = _extract_result(events, launch["max_result_chars"])
+    if not control and runtime_launch and runtime_launch["target"].get("adapter_package") == "pi-acp":
+        from pi_result import reconcile_pi_result
+        reconcile_pi_result(parsed, request)
     status = _result_status(return_code, parsed, interrupted, control)
     if cancellation_exit_code is not None and (
         cancellation_exit_code != 0 or parsed["stop_reason"] not in ("cancelled", "end_turn")

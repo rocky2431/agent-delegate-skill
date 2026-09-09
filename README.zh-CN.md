@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.4.1。
+版本：0.5.0。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -334,3 +334,21 @@ AGENT_DELEGATION_TEST_ACPX=/absolute/path/to/runtime/node_modules/.bin/acpx \
 ```
 
 测试使用隔离的临时配置和本地 ACP fixture，不调用模型，也不读取用户会话。
+
+## Pi 支持
+
+```bash
+python3 scripts/install_user.py install --hosts pi --targets pi --update-runtime
+```
+
+Pi 可作为委派目标，也可通过 `/skill:agent-delegation` 发起委派，顶层调用传
+`--caller pi`。安装路径遵循 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent/skills`。
+显式更新会在新的运行时目录安装 `pi-acp` 0.0.33，并保留旧运行时；普通 Skill
+更新不会升级运行时。Pi 沿用自己的模型、登录、扩展与会话配置。
+
+该适配器的工具在本地执行，无法兑现 ACP 的 `approve-reads`、`deny-all` 和
+`--no-terminal`，因此这些组合会被明确拒绝。回执会核对本次任务对应的原生 Pi
+会话与停止原因；原生证据缺失记为 `incomplete`，不会把模型错误当成成功。
+
+原生 Pi 包位于 `plugins/agent-delegation`，只加载 Skill，不替代 CLI 安装。
+避免与 `~/.agents/skills` 中同名副本重复加载。

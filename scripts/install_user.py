@@ -17,7 +17,7 @@ import tempfile
 from typing import Any
 
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +28,7 @@ SKILL_SOURCE = (
     / "skills"
     / "agent-delegation"
 )
-HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode")
+HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode", "pi")
 RUNTIME_PACKAGES = ("acpx", "@agentclientprotocol/claude-agent-acp", "@agentclientprotocol/codex-acp")
 LEGACY_DEFAULT_CHAR_LIMITS = {
     "max_task_chars": 200000,
@@ -48,6 +48,7 @@ def _skill_destination(home: Path, host: str) -> Path:
         "kimi": Path(os.environ.get("KIMI_CODE_HOME") or home / ".kimi-code").expanduser() / "skills",
         "zcode": home / ".zcode" / "skills",
         "opencode": home / ".config" / "opencode" / "skills",
+        "pi": Path(os.environ.get("PI_CODING_AGENT_DIR") or home / ".pi/agent").expanduser() / "skills",
     }
     return roots[host] / "agent-delegation"
 
@@ -224,7 +225,9 @@ def _version_line(argv: list[str]) -> str:
 
 def _runtime_versions(runtime_root: Path) -> dict[str, str]:
     versions = {}
-    for name in RUNTIME_PACKAGES:
+    for name in (*RUNTIME_PACKAGES, "pi-acp"):
+        if name == "pi-acp" and not (runtime_root / "node_modules/pi-acp/package.json").exists():
+            continue
         version = _read_json_object(runtime_root / "node_modules" / name / "package.json").get("version")
         if not isinstance(version, str) or not version:
             raise InstallError(f"Missing runtime package {name} in {runtime_root}; use install --update-runtime")
@@ -273,7 +276,7 @@ def _install_runtime(home: Path, backup: Path, replace_existing: bool,
         }, 0o644)
         completed = subprocess.run(
             [npm, "install", "--save-exact", "--ignore-scripts", "--no-audit", "--no-fund",
-             *[name + "@latest" for name in RUNTIME_PACKAGES]],
+             *[name + "@latest" for name in RUNTIME_PACKAGES], "pi-acp@0.0.33"],
             cwd=runtime_root, text=True, capture_output=True, timeout=300, check=False,
         )
         if completed.returncode != 0:
@@ -304,6 +307,7 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
         "hermes": home / ".local/bin/hermes", "claude": home / ".local/bin/claude",
         "codex": home / ".local/bin/codex", "kimi": home / ".kimi-code/bin/kimi",
         "zcode": home / ".local/bin/zcode-acp", "opencode": home / ".opencode/bin/opencode",
+        "pi": home / ".local/bin/pi",
     }
     for name in names:
         command = "zcode-acp" if name == "zcode" else name
@@ -317,6 +321,12 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
                 raise InstallError(f"ACP adapter is missing or not executable: {adapter}; use install --update-runtime")
             argv = [str(adapter)]
             provenance = f"@agentclientprotocol/{package} with the local {name} CLI"
+        elif name == "pi":
+            adapter = (runtime_root / "node_modules/.bin/pi-acp").resolve()
+            if not adapter.is_file() or not os.access(adapter, os.X_OK):
+                raise InstallError("Pi ACP adapter is missing; use install --update-runtime")
+            argv = [str(adapter)]
+            provenance = "pi-acp bridging the existing local Pi CLI through RPC"
         elif name == "zcode":
             bundle = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
             if not bundle.is_file():
@@ -335,6 +345,9 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
                 cli_env={"CLAUDE_CODE_EXECUTABLE" if name == "claude" else "CODEX_PATH": str(executable)},
                 adapter_package="@agentclientprotocol/" + package,
             )
+        elif name == "pi":
+            targets[name].update(cli_env={"PI_ACP_PI_COMMAND": str(executable)},
+                                 adapter_package="pi-acp", native_local_tools=True)
         elif name == "zcode":
             targets[name]["version_argv"] = [str(node), str(bundle), "--version"]
             targets[name]["cli_path"] = str(bundle)
@@ -438,7 +451,7 @@ def _install(args: argparse.Namespace) -> int:
     # selected Skill hosts exclude them; custom registrations are left alone.
     if args.update_runtime:
         existing_targets = _read_json_object(home / ".config/agent-delegation/config.json").get("targets", {})
-        for name in ("claude", "codex"):
+        for name in ("claude", "codex", "pi"):
             previous = existing_targets.get(name, {})
             if name not in target_names and (previous.get("adapter_package") or
                     str(previous.get("provenance", "")).startswith("@agentclientprotocol/")):

@@ -3,7 +3,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 Agent Delegation lets one local coding agent hand a mission to another. It works
-with Hermes, Claude Code, Codex, Kimi Code, zCode, OpenCode, and other registered
+with Hermes, Claude Code, Codex, Kimi Code, zCode, OpenCode, Pi, and other registered
 ACP agents.
 
 The worker receives the goal, relevant context, existing authority, and a useful
@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.4.1.
+Version: 0.5.0.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -43,7 +43,7 @@ git clone https://github.com/rocky2431/agent-delegate-skill.git
 cd agent-delegate-skill
 ```
 
-If all six supported CLIs are installed, install everything and check it:
+If all seven supported CLIs are installed, install everything and check it:
 
 ```bash
 python3 scripts/install_user.py install
@@ -68,6 +68,28 @@ The portable Skill is installed in these native user directories:
 | Kimi Code | `$KIMI_CODE_HOME/skills/agent-delegation` (default `~/.kimi-code/skills/agent-delegation`) |
 | zCode | `~/.zcode/skills/agent-delegation` |
 | OpenCode | `~/.config/opencode/skills/agent-delegation` |
+| Pi | `$PI_CODING_AGENT_DIR/skills/agent-delegation` (default `~/.pi/agent/skills/agent-delegation`) |
+
+### Pi
+
+```bash
+python3 scripts/install_user.py install --hosts pi --targets pi --update-runtime
+```
+
+The explicit runtime upgrade installs pinned `pi-acp` 0.0.33 in a new runtime
+generation and preserves the previous one. Skill-only updates do not upgrade
+runtimes; an existing runtime without this adapter needs `--update-runtime`.
+Pi keeps its own model, authentication, extensions and session configuration.
+In Pi, invoke `/skill:agent-delegation`; at the top level use `--caller pi`.
+The optional native Pi package is `plugins/agent-delegation` (Skills only);
+it does not install the shared CLI/runtime. Choose one Skill installation path
+to avoid duplicate discovery through Pi and `~/.agents/skills`.
+
+Pi tools run locally. The managed target rejects ACP `approve-reads`, `deny-all`
+and `--no-terminal`, since this adapter cannot enforce them. `end_turn` alone
+is insufficient: the wrapper reads the exact mapped Pi session branch and this
+mission ID, recording the native stop reason. Missing/mismatched evidence is
+`incomplete`; provider errors cannot become `success`.
 
 ### Codex plugin
 
@@ -100,6 +122,7 @@ a separate installation.
 | Kimi Code | `kimi acp` |
 | zCode | the installed `zcode-acp` bridge |
 | OpenCode | `opencode acp` |
+| Pi | `pi-acp` → the bound local `pi --mode rpc` |
 
 Managed targets keep their normal model, authentication, tools, and plugin
 configuration. The zCode entry uses `--no-browser` to prevent an unattended

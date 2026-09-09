@@ -129,6 +129,7 @@ class InstallerTests(unittest.TestCase):
             "kimi": home / ".kimi-code/skills/agent-delegation",
             "zcode": home / ".zcode/skills/agent-delegation",
             "opencode": home / ".config/opencode/skills/agent-delegation",
+            "pi": home / ".pi/agent/skills/agent-delegation",
         }
         self.assertEqual(
             {host: install_user._skill_destination(home, host) for host in install_user.HOSTS},

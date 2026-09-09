@@ -1,11 +1,12 @@
 {
   "name": "agent-delegation-runtime",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "description": "Reproducible development snapshot; user runtimes update independently.",
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.75.1",
     "@agentclientprotocol/codex-acp": "1.10.0",
-    "acpx": "0.13.2"
+    "acpx": "0.13.2",
+    "pi-acp": "0.0.33"
   }
 }

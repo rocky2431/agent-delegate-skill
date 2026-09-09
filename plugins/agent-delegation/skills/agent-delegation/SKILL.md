@@ -1,6 +1,6 @@
 ---
 name: agent-delegation
-description: Delegate missions between Hermes, Claude Code, Codex, Kimi, zCode, OpenCode, or another installed ACP agent, with native session continuation and inspectable results.
+description: Delegate missions between Hermes, Claude Code, Codex, Kimi, zCode, OpenCode, Pi, or another installed ACP agent, with native session continuation and inspectable results.
 ---
 
 # Agent Delegation
@@ -73,6 +73,9 @@ The worker does not automatically inherit the caller's conversation or model. Pa
 
 Capability is not authority. Delegation carries the owner's existing authorization and cannot enlarge it. Pause only before an ungranted effect; continue unrelated analysis and preparation. Do not ask for the same in-scope authorization again merely because work moved to another agent.
 
+Pi can initiate missions through this same CLI; pass `--caller pi` at the top level.
+Use its native Skill entry `/skill:agent-delegation`.
+
 The wrapper defaults to `approve-all` with Terminal advertised. Network, Shell, and tool choices are not removed merely because a task is described as read-only. `--authorization-note` is optional receipt metadata, never a startup gate or a permission grant.
 
 Use `approve-reads`, `deny-all`, or `--no-terminal` only for an intentional capability restriction. ACPX cannot infer the semantic safety of arbitrary Shell commands; a restricted non-interactive permission request can return `denied`. Do not add command-text allowlists. A cwd and a prompt are not an OS sandbox; preserve any real host or tool policy required by the task.
@@ -89,6 +92,12 @@ existing project document paths, or `documents/<work-id>/` for new business arti
 without a convention; keep private receipts in their existing runtime location.
 
 `success` means the ACP turn ended normally, not that the user's outcome is proven. Integrate the result and verify decision-critical claims proportionally. Tool errors such as a missing optional file do not automatically invalidate a completed turn. Inspect their details instead of requiring an empty error list or repeating all of the worker's work.
+
+For the managed Pi target, `pi-acp` runs the bound local Pi CLI through RPC. Its
+tools execute locally, so `approve-reads`, `deny-all`, and `--no-terminal` are
+rejected rather than presented as effective restrictions. The receipt reconciles
+ACP `end_turn` with this mission in the mapped native Pi session; missing native
+evidence is `incomplete`. A native model error is not successful delegation.
 
 There is no default task/result character cap. Timeout and depth come from the registry; `doctor --to <target> --json` shows effective limits and target health. Run it when diagnosing a failure, not as a mandatory gate before each delegation.
 
