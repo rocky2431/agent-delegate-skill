@@ -1,6 +1,6 @@
 {
   "name": "agent-delegation",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "keywords": ["pi-package"],
   "pi": { "skills": ["./skills"] }

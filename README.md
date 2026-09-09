@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.6.0.
+Version: 0.6.1.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)

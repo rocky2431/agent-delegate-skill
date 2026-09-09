@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200

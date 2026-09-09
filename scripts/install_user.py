@@ -17,7 +17,7 @@ import tempfile
 from typing import Any
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
