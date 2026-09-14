@@ -30,7 +30,9 @@ This Skill handles external ACP missions only.
 
 - **Codex:** use `submit --caller codex --notify codex` when this host consumes
   its native message queue. Its independent observer sends one completion event
-  to the captured originating thread. This route passed a five-minute Pi mission
+  to the captured originating thread. Collect its full result with `wait --id`;
+  in the originating task this also removes that event if it is still queued.
+  This route passed a five-minute Pi mission
   and idle wakeup on Desktop 26.903.61454; verify the consumer on other hosts.
   A `functions.exec` watcher plus `send_message_to_thread` failed the same idle
   requirement: it sent only after the next user turn. Do not treat code-cell
@@ -60,6 +62,7 @@ Read the JSON on every return; a successful command exit is not task completion.
 
 | Returned state | Next action |
 |---|---|
+| `already_collected: true` | This task already collected the result. Continue without integrating or announcing it again; use explicit `--replay` only if recovery requires the original output. |
 | `terminal: false` (`starting`, `queued`, or `running`) | Keep this ID and the completion observer. Do independent work or yield. |
 | `wait_timed_out: true` | An explicitly bounded observation ended; the task continues. Keep its completion delivery, or arrange one background wait on this ID. Do not create a repeated model wait loop, resubmit, or cancel because an observation expired. |
 | `terminal: true`, `status: success` | Read `assistant_text` and `assistant_content`, integrate the result, and verify decision-critical claims proportionally. |
@@ -74,7 +77,21 @@ means: "The wrapper ended without a final result; native execution remains unkno
 Inspect native state and effects before retrying." Here `terminal` ends wrapper
 observation; it does not establish that the native task stopped.
 
-`status --id <delegation_id>` reads progress immediately and retrieves the same full result after completion. If a submit response is lost, recover the ID from its stderr receipt or saved request before submitting again. If the host interrupts a `wait`, resume observation with the same ID; the submitted task runs independently of that observer.
+`status --id <delegation_id>` is read-only inspection. A full terminal `wait`
+collects the originating Codex task's queued notification under the sender's lock;
+it preserves the result receipt. `wait --event` and reads from another Codex task
+do not consume notifications. If you already integrated a result obtained through
+`status` or a file read, run `ack --id <delegation_id>` in its originating task.
+An acknowledgment does not mean business acceptance. Check `notification.collection_error`
+if cleanup fails; retain the receipt and recover acknowledgment without resubmitting.
+If a late event is already marked `collected`, continue current work without another
+result read, dispatch, or user-facing "already handled" reply.
+Repeated full waits in that originating task return a compact `already_collected`
+event instead of replaying worker content, including concurrent waits. Use
+`wait --id <delegation_id> --replay` only for deliberate rereading or recovery
+after interrupted collection; the immutable receipt remains available.
+
+If a submit response is lost, recover the ID from its stderr receipt or saved request before submitting again. If the host interrupts a `wait`, resume observation with the same ID; the submitted task runs independently of that observer.
 
 The timeouts have different meanings: optional `wait --timeout` limits one diagnostic
 observation (zero reads once); without it, observation waits for completion.

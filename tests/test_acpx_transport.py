@@ -24,6 +24,7 @@ def serve_fixture() -> None:
     state = Path(os.environ["DELEGATION_FIXTURE_STATE"])
     output_lock = threading.Lock()
     cancelled = threading.Event()
+    permission_reply = threading.Event()
     native_version = subprocess.check_output([os.environ["CODEX_PATH"], "--version"], text=True).strip() if os.environ.get("DELEGATION_FIXTURE_NATIVE") else "unused"
 
     def send(value: dict) -> None:
@@ -40,6 +41,15 @@ def serve_fixture() -> None:
         marker = text.rsplit("CASE:", 1)[-1].strip()
         cancelled.clear()
         response = native_version if marker == "identity" else f"{marker}:turn={turns}"
+        if marker == "permission":
+            permission_reply.clear()
+            send({"id": "fixture-permission", "method": "session/request_permission", "params": {
+                "sessionId": session,
+                "toolCall": {"toolCallId": "fixture-write", "title": "Fixture write", "kind": "edit", "status": "pending"},
+                "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                            {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]}})
+            if not permission_reply.wait(5):
+                raise RuntimeError("Missing fixture permission response")
         send({"method": "session/update", "params": {"sessionId": session, "update": {
             "sessionUpdate": "agent_message_chunk",
             "content": {"type": "text", "text": response}}}})
@@ -56,6 +66,9 @@ def serve_fixture() -> None:
 
     for line in sys.stdin:
         request = json.loads(line)
+        if request.get("id") == "fixture-permission" and "result" in request:
+            permission_reply.set()
+            continue
         method = request.get("method")
         result: dict = {}
         if method == "initialize":
@@ -78,6 +91,44 @@ def serve_fixture() -> None:
 @unittest.skipUnless(os.environ.get("AGENT_DELEGATION_TEST_ACPX"),
                      "Set AGENT_DELEGATION_TEST_ACPX to the installed ACPX executable")
 class NativeTransportTests(unittest.TestCase):
+    def test_clean_followup_does_not_inherit_permission_denial(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="delegation-permission-turn-") as temporary:
+            root = Path(temporary)
+            (root / "state").mkdir()
+            (root / "native-home").mkdir()
+            preload = root / "isolate-home.cjs"
+            preload.write_text("require('node:os').homedir=()=>process.env.DELEGATION_FIXTURE_HOME;"
+                               "require('node:module').syncBuiltinESMExports();\n")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"schema_version": 1,
+                "acpx_path": os.environ["AGENT_DELEGATION_TEST_ACPX"],
+                "receipt_root": str(root / "receipts"), "default_timeout_seconds": 10,
+                "max_timeout_seconds": 30, "max_delegation_depth": 4,
+                "targets": {"fixture": {"argv": [sys.executable, str(Path(__file__).resolve()), "--fixture"]}}}))
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGENT_DELEGATION_", "DELEGATION_FIXTURE_"))}
+            env.update(AGENT_DELEGATION_CONFIG=str(registry),
+                       DELEGATION_FIXTURE_HOME=str(root / "native-home"),
+                       DELEGATION_FIXTURE_STATE=str(root / "state"),
+                       NODE_OPTIONS="--require " + str(preload))
+            base = [sys.executable, str(SCRIPT), "run", "--to", "fixture", "--cwd", str(root),
+                    "--session", "permission-followup", "--permissions", "deny-all", "--no-terminal"]
+            try:
+                for case, expected in (("permission", "denied"), ("clean-followup", "success"), ("permission", "denied")):
+                    result = subprocess.run(base + ["--task", "CASE:" + case], env=env, text=True,
+                                            capture_output=True, timeout=30)
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(payload["status"], expected, result.stdout + result.stderr)
+                    self.assertEqual(payload["stop_reason"], "end_turn")
+                    self.assertEqual(result.returncode, 0 if expected == "success" else 5)
+                    if case == "clean-followup":
+                        self.assertEqual(payload["exit_code"], 5, "The native stale exit code must remain inspectable")
+                        self.assertEqual(payload["permission_request_count"], 0)
+                        self.assertIn("cumulative", payload["status_note"])
+            finally:
+                subprocess.run([sys.executable, str(SCRIPT), "close", "--to", "fixture", "--cwd", str(root),
+                                "--session", "permission-followup"], env=env, capture_output=True, timeout=20)
+
     def test_independent_tasks_continuation_and_interruption(self) -> None:
         with tempfile.TemporaryDirectory(prefix="delegation-acpx-") as temporary:
             root = Path(temporary)

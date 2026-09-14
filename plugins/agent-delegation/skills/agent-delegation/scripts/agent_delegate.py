@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -23,7 +24,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -279,6 +280,7 @@ def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, A
     result: dict[str, Any] = {
         "stop_reason": None, "acp_session_id": None, "acpx_record_id": None,
         "parsed_event_count": 0, "unparsed_event_count": 0,
+        "permission_request_count": 0,
     }
     for line in events:
         if not line.strip():
@@ -292,6 +294,8 @@ def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, A
             result["unparsed_event_count"] += 1
             continue
         result["parsed_event_count"] += 1
+        if item.get("method") == "session/request_permission":
+            result["permission_request_count"] += 1
         request_id = item.get("id")
         if isinstance(request_id, (str, int)) and isinstance(item.get("method"), str):
             methods[request_id] = item["method"]
@@ -339,7 +343,8 @@ def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, A
     return result
 
 
-def _result_status(code: int, parsed: dict[str, Any], interrupted: str | None, control: bool) -> str:
+def _result_status(code: int, parsed: dict[str, Any], interrupted: str | None, control: bool,
+                   *, acpx_version: str | None = None, named_session: bool = False) -> str:
     if interrupted:
         return interrupted
     stop = parsed["stop_reason"]
@@ -348,6 +353,14 @@ def _result_status(code: int, parsed: dict[str, Any], interrupted: str | None, c
     if code == 3 or code == 124:
         return "timeout"
     if code == 5:
+        # ACPX 0.13.2 reuses lifetime permission counts for later named-session turns.
+        # Only reconcile a fully parsed, clean end_turn; preserve the raw exit code.
+        if (acpx_version == "0.13.2" and named_session and not control and stop == "end_turn"
+                and parsed.get("permission_request_count") == 0
+                and parsed.get("unparsed_event_count") == 0 and not parsed.get("rpc_errors")
+                and parsed.get("assistant_content")):
+            parsed["status_note"] = "Ignored ACPX 0.13.2 cumulative permission exit code; this turn completed without permission requests or errors."
+            return "success"
         return "denied"
     if code == 4:
         return "not_found"
@@ -763,11 +776,6 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
     if not control and runtime_launch and runtime_launch["target"].get("adapter_package") == "pi-acp":
         from pi_result import reconcile_pi_result
         reconcile_pi_result(parsed, request)
-    status = _result_status(return_code, parsed, interrupted, control)
-    if cancellation_exit_code is not None and (
-        cancellation_exit_code != 0 or parsed["stop_reason"] not in ("cancelled", "end_turn")
-    ):
-        status = "incomplete"
     runtime_identity = None
     if phase != "queue" and runtime_file.is_file():
         runtime_identity = _read_json_object(runtime_file)
@@ -777,6 +785,13 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
     if runtime_identity:
         runtime_identity["acpx"] = _package_identity(commands[-1][0][0], "acpx")
         _atomic_write_json(receipt_dir / "runtime.json", runtime_identity)
+    acpx_identity = (runtime_identity or {}).get("acpx") or _package_identity(commands[-1][0][0], "acpx")
+    status = _result_status(return_code, parsed, interrupted, control,
+                            acpx_version=acpx_identity.get("version"), named_session=session is not None)
+    if cancellation_exit_code is not None and (
+        cancellation_exit_code != 0 or parsed["stop_reason"] not in ("cancelled", "end_turn")
+    ):
+        status = "incomplete"
     result = {
         "schema": "agent-delegation-result/v1", **parsed, "status": status,
         **{key: request[key] for key in ("delegation_id", "caller", "target", "chain", "cwd",
@@ -896,11 +911,91 @@ def _notification_destination(caller: str) -> dict[str, Any]:
             "executable": executable}
 
 
+def _codex_queue_request(executable: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Use the native queue API without starting or resuming a model thread."""
+    with subprocess.Popen([executable, "app-server", "--listen", "stdio://"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, bufsize=0) as process:
+        pending = b""
+        deadline = time.monotonic() + 10
+
+        def rpc(request_id: int, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            nonlocal pending
+            process.stdin.write((json.dumps({"id": request_id, "method": operation,
+                                            "params": arguments}) + "\n").encode())
+            while True:
+                if b"\n" not in pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                        raise DelegationError("Codex queue acknowledgment timed out; the receipt is unchanged.")
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise DelegationError("Codex queue API closed before acknowledgment.")
+                    pending += chunk
+                    continue
+                line, pending = pending.split(b"\n", 1)
+                response = json.loads(line)
+                if response.get("id") != request_id:
+                    continue
+                if "error" in response:
+                    raise DelegationError("Codex queue API: " + json.dumps(response["error"]))
+                return response["result"]
+
+        try:
+            rpc(1, "initialize", {"clientInfo": {"name": "agent_delegation", "version": VERSION},
+                                   "capabilities": {"experimentalApi": True}})
+            process.stdin.write(b'{"method":"initialized"}\n')
+            return rpc(2, method, params)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
+def _collect_notification(receipt_dir: Path) -> bool:
+    """Collect the origin's notification; return whether it was already collected."""
+    path = receipt_dir / "notification.json"
+    if not path.is_file():
+        return False
+    notification = _read_json_object(path)
+    if os.environ.get("CODEX_THREAD_ID") != notification.get("thread_id"):
+        return False
+    with (receipt_dir / "notification.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        notification = _read_json_object(path)
+        if notification.get("status") == "collected":
+            return True
+        try:
+            if notification["status"] == "queued":
+                # Accept old receipts too, but never remove an unverified queue item.
+                match = re.fullmatch(r"Queued message ([0-9a-f-]{36}) for thread ([0-9a-f-]{36})\.",
+                                     notification.get("response", ""))
+                if not match or match[2] != notification["thread_id"]:
+                    raise DelegationError("Missing verified Codex queue ID; notification retained.")
+                response = _codex_queue_request(notification["executable"], "thread/queue/delete", {
+                    "threadId": notification["thread_id"], "queuedSubmissionId": match[1]})
+                if not isinstance(response.get("deleted"), bool):
+                    raise DelegationError("Codex did not confirm queue removal; notification retained.")
+                notification["queue_removed"] = response["deleted"]
+            elif notification["status"] in ("sending", "unknown"):
+                raise DelegationError("Uncertain delivery; inspect the original queue before acknowledgment.")
+            notification.update(status="collected", collected_at=datetime.now(UTC).isoformat())
+            notification.pop("collection_error", None)
+        except (DelegationError, OSError, ValueError) as exc:
+            # A failed queue cleanup must never hide the completed worker output.
+            notification["collection_error"] = str(exc)
+        _atomic_write_json(path, notification)
+        return False
+
+
 def _notify_task(args: argparse.Namespace) -> int:
     receipt_dir = Path(args.receipt_dir) if args.command == "_notify" else _task_receipt(args.id)
     path = receipt_dir / "notification.json"
     if not path.is_file():
         raise DelegationError("This task has no notification destination; keep its original result and use wait.")
+    result = _wait_for_task(receipt_dir)
     with (receipt_dir / "notification.lock").open("a+") as lock:
         os.chmod(lock.name, 0o600)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -910,16 +1005,17 @@ def _notify_task(args: argparse.Namespace) -> int:
             notification.update(status="unknown", error="Delivery was interrupted; inspect the host queue before retrying.")
             _atomic_write_json(path, notification)
             status = "unknown"
-        if status == "queued" or (status in ("failed", "unknown") and not getattr(args, "retry", False)):
+        if status in ("queued", "collected") or (status in ("failed", "unknown") and not getattr(args, "retry", False)):
             print(json.dumps(notification, ensure_ascii=False, indent=2))
-            return 0 if status == "queued" else 1
-        result = _wait_for_task(receipt_dir)
+            return 0 if status in ("queued", "collected") else 1
         event = {"event_id": notification["event_id"], "delegation_id": result["delegation_id"],
                  "status": result["status"], "receipt_dir": str(receipt_dir)}
         if "execution_state" in result:
             event["execution_state"] = result["execution_state"]
         message = ("External delegation result: " + json.dumps(event, ensure_ascii=False) +
-                   ". Read this task's receipt and integrate the result once per event_id. "
+                   ". Collect with the loaded Agent Delegation script's wait --id " + result["delegation_id"] +
+                   "; it also removes any pending queued copy. If already integrated, use ack --id " + result["delegation_id"] +
+                   " without repeating the result or an already-handled reply. Integrate once per event_id. "
                    "Wrapper completion is not business acceptance; unknown execution needs inspection before retrying.")
         notification.update(status="sending", attempted_at=datetime.now(UTC).isoformat())
         notification.pop("error", None)
@@ -954,13 +1050,27 @@ def _observe_task(args: argparse.Namespace) -> int:
         if args.command == "wait" and args.timeout is not None and args.timeout < 0:
             raise DelegationError("Wait timeout must be non-negative seconds.")
         result = _wait_for_task(receipt_dir, args.timeout) if args.command == "wait" else _task_snapshot(receipt_dir)
+    if args.command == "ack" and not result["terminal"]:
+        raise DelegationError("A running task cannot be acknowledged; retain its completion observer.")
+    if args.command == "ack" and (receipt_dir / "notification.json").is_file():
+        origin = _read_json_object(receipt_dir / "notification.json").get("thread_id")
+        if os.environ.get("CODEX_THREAD_ID") != origin:
+            raise DelegationError("Acknowledge this result from its originating Codex task.")
+    already_collected = False
+    if result["terminal"] and (args.command == "ack" or (args.command == "wait" and not args.event)):
+        already_collected = _collect_notification(receipt_dir)
+    suppress_replay = already_collected and not getattr(args, "replay", False)
     if (receipt_dir / "notification.json").is_file():
         result["notification"] = _read_json_object(receipt_dir / "notification.json")
     output = result
-    if getattr(args, "event", False):
+    if getattr(args, "event", False) or suppress_replay:
         output = {key: result[key] for key in ("delegation_id", "terminal", "status", "receipt_dir",
                                                "execution_state", "wait_timed_out") if key in result}
         output["event_id"] = args.id + (":terminal" if result["terminal"] else ":observation")
+        if suppress_replay:
+            output["already_collected"] = True
+        if (args.command == "ack" or suppress_replay) and "notification" in result:
+            output["notification"] = result["notification"]
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return _result_exit_code(result) if args.command == "wait" and result["terminal"] else 0
 
@@ -1303,14 +1413,17 @@ def _build_parser() -> argparse.ArgumentParser:
         control.set_defaults(handler=_cancel if operation == "cancel" else _run, caller=None, chain=None, max_depth=None,
                              model=None, permissions="approve-all", terminal=True, authorization_note=None)
 
-    for operation in ("status", "wait"):
-        observer = subparsers.add_parser(operation, help="Read task progress or result without owning its execution.")
+    for operation in ("status", "wait", "ack"):
+        observer = subparsers.add_parser(operation, help=("Acknowledge a terminal result already read through another path."
+            if operation == "ack" else "Read task progress or collect the result without owning its execution."))
         observer.add_argument("--id", required=True, help="Full delegation_id returned by run or submit.")
         observer.add_argument("--event", action="store_true", help="Return a compact event and receipt path instead of the full worker output.")
         if operation == "wait":
+            observer.add_argument("--replay", action="store_true",
+                                  help="Explicitly reread a previously collected result for recovery or diagnosis.")
             observer.add_argument("--timeout", type=int,
                                   help="Optional observation limit in seconds; default waits for completion. Zero reads once; expiry never cancels execution.")
-        observer.set_defaults(handler=_observe_task)
+        observer.set_defaults(handler=_observe_task, event=operation == "ack")
 
     for operation in ("notify", "_notify"):
         notifier = subparsers.add_parser(operation, help="Deliver a saved task's completion to its original host queue.")

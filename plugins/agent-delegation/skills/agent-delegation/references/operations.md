@@ -140,11 +140,37 @@ submission. A separate observer waits on the existing worker lock and invokes
 reports a worker that exited without a result as `incomplete` / unknown execution.
 Worker termination releases the OS lock; no completion-file polling is required.
 
-`notification.json` tracks `pending`, `sending`, `queued`, `failed`, or `unknown`.
+`notification.json` tracks `pending`, `sending`, `queued`, `collected`, `failed`, or `unknown`.
 The event contains a stable `event_id`, delegation ID, wrapper outcome and receipt
 path; it does not copy the worker's conversation into the parent. Delivery is
 serialized per task. A repeated `notify` does not enqueue an already queued event.
 The recipient should integrate each `event_id` once in its existing task record.
+A full terminal `wait` in the captured originating task collects its notification:
+it removes only that saved queue ID through native `thread/queue/delete`, then
+records `collected`. This short-lived App Server manages the shared persistent
+queue only; it never resumes a thread or starts a model turn. A repeated `notify`
+cannot resend a collected event. `status`, `wait --event`, and another task's reads
+remain passive. After integrating a direct file/status read, use `ack --id <id>`
+in the original task; it returns a compact acknowledgment instead of repeating
+the worker text. Collection is transport bookkeeping, not business acceptance.
+Concurrent or repeated full waits in the originating task return the worker
+content once after successful collection; later waits return `already_collected`
+with the receipt path. `wait --replay` explicitly rereads it. If collection was
+interrupted after saving the marker but before output reached the caller, recover
+through that explicit replay or the immutable receipt. This is not an assertion
+that the caller integrated or accepted the work.
+
+Queue deletion requires the host's native API. Failure leaves the notification
+state intact and adds `collection_error`, without hiding worker output or deleting
+receipts. A `deleted: false` response means the item is no longer queued; a model
+turn already started from it cannot be undone. Keep result integration idempotent.
+Never clear an entire queue or treat an event-only observer as result consumption.
+
+ACPX 0.13.2 has an observed named-session permission accounting defect: an earlier
+denial can produce exit 5 for a later clean turn. The wrapper reconciles only this
+version, with a complete parsed `end_turn`, assistant output, no new permission
+requests and no RPC errors. It records `status_note` and preserves raw `exit_code`;
+actual current-turn permission failures and uncertain output remain failures.
 
 **Queue acceptance is not automatic wakeup.** Some hosts may only drain queued
 input at a later user turn. Verify an idle-session probe in the actual Codex host
@@ -157,6 +183,14 @@ at 17:06:13. No intervening user turn or scheduled run occurred. Delegation
 `6b6350c9e2b14717a7f1d3222ef0b4b8` took 306.91 execution seconds and ended with a
 verified native Pi stop. This establishes idle delivery for that configuration,
 not every Codex host or recovery after an app restart.
+
+The collection repair was rechecked on 2026-09-14 with Codex CLI 0.153.4 and an
+independent 45-second worker fixture using no model. The parent turn ended before
+completion; the queued event started a new turn without intervening user input.
+Collecting that already-delivered event and repeating the wait suppressed replay.
+Native queue deletion, concurrent collection, and explicit replay also passed.
+This validates the common Codex receiver, not live acceptance of every target's
+model service or another originating host's notification UI.
 
 Codex ordinary async hooks do not start a new turn. Do not repeatedly call
 `wait`, use timer prompts, or spawn a new Codex

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -696,6 +697,112 @@ class AgentDelegateCliTests(unittest.TestCase):
                               "--task", "fixture", "--notify", "codex")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse((self.root / "receipts").exists())
+
+    def test_collected_result_removes_only_its_queued_notification(self) -> None:
+        task = json.loads(self.run_cli("run", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        receipt = Path(task["receipt_dir"])
+        original_result = (receipt / "result.json").read_bytes()
+        origin = "11111111-1111-4111-8111-111111111111"
+        queued = "22222222-2222-4222-8222-222222222222"
+        calls = self.root / "queue-delete.jsonl"
+        fail = self.root / "fail-delete"
+        codex = self.bin / "codex"
+        codex.write_text("#!/usr/bin/env python3\nimport json,pathlib,sys\n"
+            "for line in sys.stdin:\n"
+            " r=json.loads(line)\n"
+            " if 'id' not in r: continue\n"
+            " result={}\n"
+            " if r['method']=='thread/queue/delete':\n"
+            f"  with open({str(calls)!r},'a') as f: f.write(json.dumps(r['params'])+'\\n')\n"
+            f"  if pathlib.Path({str(fail)!r}).exists():\n"
+            "   print(json.dumps({'id':r['id'],'error':{'message':'fixture failure'}}),flush=True);continue\n"
+            "  result={'deleted':True}\n"
+            " print(json.dumps({'id':r['id'],'result':result}),flush=True)\n")
+        codex.chmod(0o755)
+        note = {"status": "queued", "thread_id": origin, "event_id": task["delegation_id"] + ":terminal",
+                "executable": str(codex), "response": f"Queued message {queued} for thread {origin}."}
+        note_path = receipt / "notification.json"
+        note_path.write_text(json.dumps(note))
+        env = {**self.environment, "CODEX_THREAD_ID": origin}
+        foreign = {**env, "CODEX_THREAD_ID": "33333333-3333-4333-8333-333333333333"}
+        # Inspection and event-only observers must not take ownership of delivery.
+        self.run_cli("status", "--id", task["delegation_id"], environment=env)
+        self.run_cli("wait", "--id", task["delegation_id"], "--event", environment=env)
+        self.run_cli("wait", "--id", task["delegation_id"], environment=foreign)
+        self.assertNotEqual(self.run_cli("ack", "--id", task["delegation_id"], environment=foreign).returncode, 0)
+        self.assertFalse(calls.exists())
+        fail.touch()
+        result = json.loads(self.run_cli("wait", "--id", task["delegation_id"], environment=env).stdout)
+        self.assertEqual(result["assistant_text"], "delegated ok")
+        self.assertEqual(result["notification"]["status"], "queued")
+        self.assertIn("fixture failure", result["notification"]["collection_error"])
+        fail.unlink()
+        result = json.loads(self.run_cli("wait", "--id", task["delegation_id"], environment=env).stdout)
+        self.assertEqual(result["notification"]["status"], "collected")
+        self.assertTrue(result["notification"]["queue_removed"])
+        self.assertEqual(result["assistant_text"], "delegated ok")
+        self.assertEqual((receipt / "result.json").read_bytes(), original_result)
+        repeated = json.loads(self.run_cli("wait", "--id", task["delegation_id"], environment=env).stdout)
+        self.assertTrue(repeated["already_collected"])
+        self.assertNotIn("assistant_text", repeated)
+        replay = json.loads(self.run_cli("wait", "--id", task["delegation_id"], "--replay", environment=env).stdout)
+        self.assertEqual(replay["assistant_text"], "delegated ok")
+        ack = json.loads(self.run_cli("ack", "--id", task["delegation_id"], environment=env).stdout)
+        self.assertNotIn("assistant_text", ack)
+        self.assertEqual(ack["notification"]["status"], "collected")
+        self.assertEqual(self.run_cli("notify", "--id", task["delegation_id"], "--retry", environment=env).returncode, 0)
+        self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()],
+                         [{"threadId": origin, "queuedSubmissionId": queued}] * 2)
+
+    def test_concurrent_collection_is_shared_across_targets_and_isolated_by_origin(self) -> None:
+        registry = json.loads(self.registry.read_text())
+        targets = ("claude", "zcode", "kimi", "pi")
+        for name in targets:
+            registry["targets"][name] = registry["targets"]["beta"]
+        self.registry.write_text(json.dumps(registry))
+        # These are protocol fixtures for the common receiver, not live providers.
+        for number, target in enumerate(targets, 1):
+            with self.subTest(target=target):
+                task = json.loads(self.run_cli("run", "--to", target, "--cwd", str(self.cwd), "--task", "fixture").stdout)
+                receipt = Path(task["receipt_dir"])
+                original = (receipt / "result.json").read_bytes()
+                origin = f"{number:08d}-1111-4111-8111-111111111111"
+                note_path = receipt / "notification.json"
+                note_path.write_text(json.dumps({"status": "pending", "thread_id": origin,
+                    "event_id": task["delegation_id"] + ":terminal"}))
+                foreign = {**self.environment, "CODEX_THREAD_ID": "other-task"}
+                self.run_cli("wait", "--id", task["delegation_id"], environment=foreign)
+                self.assertEqual(json.loads(note_path.read_text())["status"], "pending")
+                env = {**self.environment, "CODEX_THREAD_ID": origin}
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    outputs = list(pool.map(lambda _: self.run_cli("wait", "--id", task["delegation_id"], environment=env), range(4)))
+                self.assertTrue(all(output.returncode == 0 for output in outputs))
+                payloads = [json.loads(output.stdout) for output in outputs]
+                self.assertEqual(sum("assistant_text" in result for result in payloads), 1)
+                self.assertEqual(sum(result.get("already_collected", False) for result in payloads), 3)
+                # Collection before notification prevents even the first enqueue.
+                notice = self.run_cli("notify", "--id", task["delegation_id"], "--retry", environment=env)
+                self.assertEqual(json.loads(notice.stdout)["status"], "collected")
+                self.assertEqual((receipt / "result.json").read_bytes(), original)
+
+    def test_stale_acpx_denial_requires_a_clean_verified_turn(self) -> None:
+        spec = importlib.util.spec_from_file_location("permission_turn", SCRIPT)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        events = [json.dumps({"params": {"update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": "clean followup"}}}}),
+                  json.dumps({"result": {"stopReason": "end_turn"}})]
+        clean = wrapper._extract_result(events, None)
+        self.assertEqual(wrapper._result_status(5, clean, None, False,
+                         acpx_version="0.13.2", named_session=True), "success")
+        for extra in ({"method": "session/request_permission", "id": 1},
+                      {"error": {"message": "permission failure"}}, "unparsed"):
+            parsed = wrapper._extract_result(events + [json.dumps(extra) if isinstance(extra, dict) else extra], None)
+            self.assertEqual(wrapper._result_status(5, parsed, None, False,
+                             acpx_version="0.13.2", named_session=True), "denied")
+        for version, named in ((None, True), ("0.13.3", True), ("0.13.2", False)):
+            self.assertEqual(wrapper._result_status(5, wrapper._extract_result(events, None), None, False,
+                             acpx_version=version, named_session=named), "denied")
 
     def test_event_wait_reports_lost_worker_and_uncertain_notification_without_replay(self) -> None:
         task_id = "a" * 32
