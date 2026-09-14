@@ -41,9 +41,10 @@ This Skill handles external ACP missions only.
   keep one attached wait while the host holds the turn active, or report pending
   delivery and recover on the next user turn. Do not use model polling.
   See [host delivery and observed limits](references/operations.md#codex).
-- **Claude Code / zCode:** submit once, then run the following `wait` command once
+- **Claude Code / zCode / Kimi:** submit once, then run `wait --id <id> --event` once
   using the host's native background Bash tool (`run_in_background: true`). The
-  host reports the observer's completion; read its result then. Backgrounding
+  host reports the observer's completion; collect with a full `wait --id <id>` then.
+  The background output contains only an event and receipt path. Backgrounding
   `submit` alone reports submission, not mission completion. Do not poll TaskOutput
   or repeatedly read its output file while waiting.
 - **Other hosts:** use a native background completion notification when available,
@@ -77,19 +78,28 @@ means: "The wrapper ended without a final result; native execution remains unkno
 Inspect native state and effects before retrying." Here `terminal` ends wrapper
 observation; it does not establish that the native task stopped.
 
-`status --id <delegation_id>` is read-only inspection. A full terminal `wait`
-collects the originating Codex task's queued notification under the sender's lock;
-it preserves the result receipt. `wait --event` and reads from another Codex task
-do not consume notifications. If you already integrated a result obtained through
-`status` or a file read, run `ack --id <delegation_id>` in its originating task.
+`status --id <delegation_id>` and `wait --event` are read-only observations. A full
+terminal `wait` collects one payload per delegation ID, on every originating host,
+even without notifications. Synchronous `run` also records its returned payload as
+collected. A separate durable collection marker survives process restarts; the
+original result receipt is preserved. When a Codex origin is known, another Codex
+task's wait remains passive and cannot acknowledge it. For other hosts, only the
+designated recipient should use full `wait`/`ack`; other readers use `status`.
+If you already integrated a result obtained through `status` or a file read, run
+`ack --id <delegation_id>` in its originating task.
 An acknowledgment does not mean business acceptance. Check `notification.collection_error`
 if cleanup fails; retain the receipt and recover acknowledgment without resubmitting.
 If a late event is already marked `collected`, continue current work without another
 result read, dispatch, or user-facing "already handled" reply.
-Repeated full waits in that originating task return a compact `already_collected`
+Repeated full waits return a compact `already_collected`
 event instead of replaying worker content, including concurrent waits. Use
 `wait --id <delegation_id> --replay` only for deliberate rereading or recovery
 after interrupted collection; the immutable receipt remains available.
+Codex queue cleanup is separate from collection: an API failure can leave a compact
+notice queued, but cannot replay an already-collected payload. The native queue API
+is experimental and was tested on the recorded local host; do not promise permanent
+API compatibility or exactly-once model behavior after crashes. Native host task
+notifications may still appear; keep one observer and do not re-integrate old events.
 
 If a submit response is lost, recover the ID from its stderr receipt or saved request before submitting again. If the host interrupts a `wait`, resume observation with the same ID; the submitted task runs independently of that observer.
 

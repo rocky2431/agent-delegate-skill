@@ -77,15 +77,35 @@ is specifically useful and the host can keep that process alive. Interrupting
 The originating host owns result delivery. The execution target may be any
 registered external ACP agent; no native subagent routing is involved.
 
-### Claude Code and zCode
+### Common collection contract
 
-Submit once. Start `python3 "<skill-dir>/scripts/agent_delegate.py" wait --id <delegation_id>` through the host's
+Execution, notification, result collection, and business acceptance are separate.
+`collection.json` records one payload claim per delegation ID on every host, using
+the existing receipt lock (`notification.lock`) independently of notification state.
+Synchronous `run` and full terminal `wait` claim the payload; `ack` records an
+already-read result. Concurrent/repeated collectors return `already_collected`.
+`status`, `wait --event`, and explicit `wait --replay` preserve diagnostic/recovery
+access. A claim is not evidence that the model integrated or accepted the result;
+after an interrupted return, use explicit replay or the immutable receipt.
+
+A saved Codex origin protects against collection by another known task, including
+submissions without queue notifications. Other hosts do not provide a portable,
+verified session identity through this CLI: the designated recipient uses full
+`wait`/`ack`, and independent inspectors use `status`. This is a local collection
+contract, not an access-control boundary between processes of the same OS user.
+
+### Claude Code, zCode and Kimi
+
+Submit once. Start `python3 "<skill-dir>/scripts/agent_delegate.py" wait --id <delegation_id> --event` through the host's
 native Bash tool with `run_in_background: true`. Keep both the delegation ID and
 the host's background-task ID. The waiter remains attached to that background
 task and exits only when the real worker ends. Do not add `&`, detach the waiter,
 or background only `submit`: those report the launcher's exit rather than the
 mission's outcome. Let the host's task notification trigger collection; read the
-output after that event, not on a timer.
+compact event after completion, then collect with a full `wait --id`. The host's
+output file must not carry a second copy of the worker's full result. Native task
+notifications can still be shown after an early collection; the shared collection
+marker prevents another payload return. Do not claim to erase another host's UI.
 
 When a host tears down its background tasks, the observer can end while the
 submitted mission continues. Keep the delegation ID for later recovery. An output
@@ -140,28 +160,34 @@ submission. A separate observer waits on the existing worker lock and invokes
 reports a worker that exited without a result as `incomplete` / unknown execution.
 Worker termination releases the OS lock; no completion-file polling is required.
 
+The native queue API is experimental (`experimentalApi: true`), not a promised
+stable API. Codex CLI 0.153.4 explicitly rejects `thread/queue/list` without this
+capability. Official App Server docs describe experimental opt-in and supported
+`turn/start(toolOutput)` clients; the independent local Desktop queue adapter was
+verified through the installed CLI/schema and actual queue/idle probes. Do not
+conflate those different evidence levels or treat a separate app-server as the
+owner of the live model turn.
+
 `notification.json` tracks `pending`, `sending`, `queued`, `collected`, `failed`, or `unknown`.
 The event contains a stable `event_id`, delegation ID, wrapper outcome and receipt
 path; it does not copy the worker's conversation into the parent. Delivery is
 serialized per task. A repeated `notify` does not enqueue an already queued event.
 The recipient should integrate each `event_id` once in its existing task record.
-A full terminal `wait` in the captured originating task collects its notification:
-it removes only that saved queue ID through native `thread/queue/delete`, then
-records `collected`. This short-lived App Server manages the shared persistent
+A full terminal `wait` first claims the payload through the common collection
+contract. In the captured originating task it also removes only the saved queue
+ID through native `thread/queue/delete` and records notification `collected`.
+This short-lived App Server manages the shared persistent
 queue only; it never resumes a thread or starts a model turn. A repeated `notify`
 cannot resend a collected event. `status`, `wait --event`, and another task's reads
 remain passive. After integrating a direct file/status read, use `ack --id <id>`
 in the original task; it returns a compact acknowledgment instead of repeating
 the worker text. Collection is transport bookkeeping, not business acceptance.
-Concurrent or repeated full waits in the originating task return the worker
-content once after successful collection; later waits return `already_collected`
-with the receipt path. `wait --replay` explicitly rereads it. If collection was
-interrupted after saving the marker but before output reached the caller, recover
-through that explicit replay or the immutable receipt. This is not an assertion
-that the caller integrated or accepted the work.
+Concurrent or repeated full waits return `already_collected` after the first
+payload claim, including when queue cleanup failed. Explicit replay and the
+immutable receipt provide recovery after an interrupted return.
 
 Queue deletion requires the host's native API. Failure leaves the notification
-state intact and adds `collection_error`, without hiding worker output or deleting
+state intact and adds `collection_error`, without undoing result collection or deleting
 receipts. A `deleted: false` response means the item is no longer queued; a model
 turn already started from it cannot be undone. Keep result integration idempotent.
 Never clear an entire queue or treat an event-only observer as result consumption.
@@ -212,13 +238,31 @@ the event. Inspect the original queue before an explicit retry. There is no
 automatic retry of uncertain delivery and no claim of exactly-once handling
 across process failure. Task execution is never resubmitted by notification recovery.
 
-Native references checked 2026-09-09:
-[Claude background Bash](https://code.claude.com/docs/en/interactive-mode#background-bash-commands),
-[Claude hooks](https://code.claude.com/docs/en/hooks#run-hooks-in-the-background),
-[Codex async hooks](https://learn.chatgpt.com/docs/hooks#run-hooks-in-the-background).
-The local `codex queue --help` exposes the queue command. The installed zCode
-runtime exposes background Bash, completion-notification enqueueing and task IDs;
-runtime presence alone is not end-to-end host acceptance.
+### Official interfaces and evidence limits
+
+Relevant official references were checked on 2026-09-14. Documentation establishes
+the host facility; it does not certify this wrapper or every host/version pair.
+
+| Host | Official basis | Integration boundary |
+| --- | --- | --- |
+| Codex | [App Server experimental opt-in](https://learn.chatgpt.com/docs/app-server#experimental-api-opt-in) | Desktop queue methods require the experimental capability. Installed CLI/schema and native queue/idle probes establish support on the recorded version. |
+| Claude Code | [Background Bash](https://code.claude.com/docs/en/interactive-mode#background-bash-commands), [async hook wakeup](https://code.claude.com/docs/en/hooks#run-hooks-in-the-background) | Use one native background observer. Host exit can terminate background tasks; preserve the delegation ID for recovery. |
+| zCode | [Subagents](https://zcode.z.ai/cn/docs/subagents), [hooks](https://zcode.z.ai/cn/docs/hooks) | Installed 0.16.5 also exposes background Bash and completion notices. These sources and code inspection alone do not prove a live external-delegation round trip. |
+| Kimi Code | [Built-in Bash tools](https://moonshotai.github.io/kimi-code/en/reference/tools.html) | Native background Bash reports completion and owns timeout/cleanup. A CLI process that exits cannot be assumed to keep observing. |
+| Pi | [Extension message delivery](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md) | `sendMessage` with `triggerTurn` can wake a session through a loaded extension. This Skills-only package does not install that extension; use one attached wait unless the host already supplies a wake facility. |
+
+The host-independent collection contract was checked across all 25 combinations
+of Codex, Claude, zCode, Kimi and Pi caller/target labels with deterministic worker
+fixtures, including concurrent collectors. These are shared-logic checks, not 25
+live model-service acceptance tests. Real Claude Code and Kimi Code origins
+calling native Codex also passed background completion followed by one payload
+and one compact `already_collected` result on 2026-09-14. zCode 0.16.5 submitted
+and armed its background observer, but its single-prompt process then exited;
+resuming that native session and collecting the original delegation passed.
+That is recovery evidence, not proof of idle wakeup in zCode Desktop.
+The native response included progress
+text before its expected final marker; do not confuse response formatting with
+delivery failure or silently discard progress content.
 
 Observed host checks on 2026-09-09: the independent Codex queue notifier passed
 idle wakeup. The earlier five-minute Pi test rejected the code-runner recipe as
@@ -318,6 +362,8 @@ Each `run`, `submit`, or native session control creates a private directory unde
   consumes and removes it; inherited environment secrets are not serialized.
 - `result.json`: terminal state, text, original content blocks, session ids,
   structured RPC/tool errors, runtime identity, and receipt location.
+- `collection.json`: host-independent payload claim; `notification.lock` serializes
+  this claim with optional host notification changes. It is not business acceptance.
 - `runtime.json`: CLI path/version, adapter path/version, ACPX path/version, and
   adapter launch PID/time. Named sessions reuse the startup record under
   `.session-locks/`; the final receipt gets its own copy. `observation` distinguishes

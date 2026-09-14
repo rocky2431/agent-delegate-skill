@@ -699,7 +699,8 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertFalse((self.root / "receipts").exists())
 
     def test_collected_result_removes_only_its_queued_notification(self) -> None:
-        task = json.loads(self.run_cli("run", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        task = json.loads(self.run_cli("submit", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        self.run_cli("wait", "--id", task["delegation_id"], "--event")
         receipt = Path(task["receipt_dir"])
         original_result = (receipt / "result.json").read_bytes()
         origin = "11111111-1111-4111-8111-111111111111"
@@ -740,11 +741,17 @@ class AgentDelegateCliTests(unittest.TestCase):
         result = json.loads(self.run_cli("wait", "--id", task["delegation_id"], environment=env).stdout)
         self.assertEqual(result["notification"]["status"], "collected")
         self.assertTrue(result["notification"]["queue_removed"])
-        self.assertEqual(result["assistant_text"], "delegated ok")
+        self.assertTrue(result["already_collected"])
+        self.assertNotIn("assistant_text", result, "queue cleanup failure must not defeat payload deduplication")
         self.assertEqual((receipt / "result.json").read_bytes(), original_result)
         repeated = json.loads(self.run_cli("wait", "--id", task["delegation_id"], environment=env).stdout)
         self.assertTrue(repeated["already_collected"])
         self.assertNotIn("assistant_text", repeated)
+        # A pre-upgrade receipt has only the legacy notification collection marker.
+        (receipt / "collection.json").unlink()
+        migrated = json.loads(self.run_cli("wait", "--id", task["delegation_id"], environment=env).stdout)
+        self.assertTrue(migrated["already_collected"])
+        self.assertNotIn("assistant_text", migrated)
         replay = json.loads(self.run_cli("wait", "--id", task["delegation_id"], "--replay", environment=env).stdout)
         self.assertEqual(replay["assistant_text"], "delegated ok")
         ack = json.loads(self.run_cli("ack", "--id", task["delegation_id"], environment=env).stdout)
@@ -763,7 +770,8 @@ class AgentDelegateCliTests(unittest.TestCase):
         # These are protocol fixtures for the common receiver, not live providers.
         for number, target in enumerate(targets, 1):
             with self.subTest(target=target):
-                task = json.loads(self.run_cli("run", "--to", target, "--cwd", str(self.cwd), "--task", "fixture").stdout)
+                task = json.loads(self.run_cli("submit", "--to", target, "--cwd", str(self.cwd), "--task", "fixture").stdout)
+                self.run_cli("wait", "--id", task["delegation_id"], "--event")
                 receipt = Path(task["receipt_dir"])
                 original = (receipt / "result.json").read_bytes()
                 origin = f"{number:08d}-1111-4111-8111-111111111111"
@@ -784,6 +792,42 @@ class AgentDelegateCliTests(unittest.TestCase):
                 notice = self.run_cli("notify", "--id", task["delegation_id"], "--retry", environment=env)
                 self.assertEqual(json.loads(notice.stdout)["status"], "collected")
                 self.assertEqual((receipt / "result.json").read_bytes(), original)
+
+    def test_collection_without_notification_covers_all_origin_and_target_pairs(self) -> None:
+        registry = json.loads(self.registry.read_text())
+        hosts = ("codex", "claude", "zcode", "kimi", "pi")
+        for name in hosts:
+            registry["targets"][name] = registry["targets"]["beta"]
+        self.registry.write_text(json.dumps(registry))
+        env = {**self.environment, "CODEX_THREAD_ID": "11111111-1111-4111-8111-111111111111"}
+        for caller in hosts:
+            for target in hosts:
+                with self.subTest(caller=caller, target=target):
+                    task = json.loads(self.run_cli("submit", "--to", target, "--caller", caller,
+                        "--cwd", str(self.cwd), "--task", "fixture", environment=env).stdout)
+                    task_id = task["delegation_id"]
+                    self.run_cli("wait", "--id", task_id, "--event", environment=env)
+                    self.assertFalse((Path(task["receipt_dir"]) / "collection.json").exists())
+                    if caller == "codex":
+                        foreign = {**env, "CODEX_THREAD_ID": "another-task"}
+                        inspected = self.run_cli("wait", "--id", task_id, environment=foreign)
+                        self.assertIn("assistant_text", json.loads(inspected.stdout))
+                        self.assertFalse((Path(task["receipt_dir"]) / "collection.json").exists())
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        results = list(pool.map(lambda _: self.run_cli("wait", "--id", task_id, environment=env), range(2)))
+                    outputs = [json.loads(result.stdout) for result in results]
+                    self.assertEqual(sum("assistant_text" in result for result in outputs), 1)
+                    self.assertEqual(sum(result.get("already_collected", False) for result in outputs), 1)
+                    self.assertIn("assistant_text", json.loads(self.run_cli("status", "--id", task_id, environment=env).stdout))
+
+    def test_synchronous_result_and_ack_without_notification_do_not_replay(self) -> None:
+        task = json.loads(self.run_cli("run", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        self.assertTrue(json.loads(self.run_cli("wait", "--id", task["delegation_id"]).stdout)["already_collected"])
+        self.assertEqual(json.loads(self.run_cli("wait", "--id", task["delegation_id"], "--replay").stdout)["assistant_text"], "delegated ok")
+        submitted = json.loads(self.run_cli("submit", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
+        self.run_cli("wait", "--id", submitted["delegation_id"], "--event")
+        self.run_cli("ack", "--id", submitted["delegation_id"])
+        self.assertTrue(json.loads(self.run_cli("wait", "--id", submitted["delegation_id"]).stdout)["already_collected"])
 
     def test_stale_acpx_denial_requires_a_clean_verified_turn(self) -> None:
         spec = importlib.util.spec_from_file_location("permission_turn", SCRIPT)

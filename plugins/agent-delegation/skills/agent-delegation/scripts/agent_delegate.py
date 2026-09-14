@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -596,6 +596,8 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
         "legacy_session": selected_argv != target.get("launch_argv", target["argv"]),
         "operation": args.command,
     }
+    if caller == "codex" and os.environ.get("CODEX_THREAD_ID"):
+        request["origin_thread_id"] = os.environ["CODEX_THREAD_ID"]
     # Only public launch metadata travels in the receipt, never ambient secrets.
     runtime_launch = {"name": args.to, "acpx_path": registry["acpx_path"], "target": {
         key: target[key] for key in ("argv", "version_argv", "cli_path", "cli_env", "adapter_package", "adapter_version_argv") if key in target}}
@@ -808,6 +810,8 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
         "runtime_identity": runtime_identity,
     }
     _atomic_write_json(receipt_dir / "result.json", result)
+    if request["operation"] == "run":
+        _collect_result(receipt_dir, result["delegation_id"])
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return _result_exit_code(result)
 
@@ -954,19 +958,36 @@ def _codex_queue_request(executable: str, method: str, params: dict[str, Any]) -
                 process.kill()
 
 
-def _collect_notification(receipt_dir: Path) -> bool:
-    """Collect the origin's notification; return whether it was already collected."""
+def _collect_result(receipt_dir: Path, task_id: str) -> bool:
+    """Claim one result payload independently of its host notification transport."""
+    with (receipt_dir / "notification.lock").open("a+") as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        path = receipt_dir / "collection.json"
+        if path.is_file():
+            if _read_json_object(path).get("event_id") != task_id + ":terminal":
+                raise DelegationError("Result collection identity is invalid; inspect the original receipt.")
+            return True
+        note_path = receipt_dir / "notification.json"
+        legacy = _read_json_object(note_path) if note_path.is_file() else {}
+        _atomic_write_json(path, {"event_id": task_id + ":terminal",
+                                 "collected_at": datetime.now(UTC).isoformat()})
+        return legacy.get("status") == "collected"
+
+
+def _collect_notification(receipt_dir: Path) -> None:
+    """Clean up only the origin's queued notification; result collection is separate."""
     path = receipt_dir / "notification.json"
     if not path.is_file():
-        return False
+        return
     notification = _read_json_object(path)
     if os.environ.get("CODEX_THREAD_ID") != notification.get("thread_id"):
-        return False
+        return
     with (receipt_dir / "notification.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         notification = _read_json_object(path)
         if notification.get("status") == "collected":
-            return True
+            return
         try:
             if notification["status"] == "queued":
                 # Accept old receipts too, but never remove an unverified queue item.
@@ -987,7 +1008,6 @@ def _collect_notification(receipt_dir: Path) -> bool:
             # A failed queue cleanup must never hide the completed worker output.
             notification["collection_error"] = str(exc)
         _atomic_write_json(path, notification)
-        return False
 
 
 def _notify_task(args: argparse.Namespace) -> int:
@@ -1005,6 +1025,9 @@ def _notify_task(args: argparse.Namespace) -> int:
             notification.update(status="unknown", error="Delivery was interrupted; inspect the host queue before retrying.")
             _atomic_write_json(path, notification)
             status = "unknown"
+        if (receipt_dir / "collection.json").is_file():
+            print(json.dumps({**notification, "skipped": "already_collected"}, ensure_ascii=False, indent=2))
+            return 1 if status in ("failed", "unknown") else 0
         if status in ("queued", "collected") or (status in ("failed", "unknown") and not getattr(args, "retry", False)):
             print(json.dumps(notification, ensure_ascii=False, indent=2))
             return 0 if status in ("queued", "collected") else 1
@@ -1052,16 +1075,22 @@ def _observe_task(args: argparse.Namespace) -> int:
         result = _wait_for_task(receipt_dir, args.timeout) if args.command == "wait" else _task_snapshot(receipt_dir)
     if args.command == "ack" and not result["terminal"]:
         raise DelegationError("A running task cannot be acknowledged; retain its completion observer.")
-    if args.command == "ack" and (receipt_dir / "notification.json").is_file():
+    request = _read_json_object(receipt_dir / "request.json")
+    origin = request.get("origin_thread_id")
+    if not origin and (receipt_dir / "notification.json").is_file():
         origin = _read_json_object(receipt_dir / "notification.json").get("thread_id")
-        if os.environ.get("CODEX_THREAD_ID") != origin:
-            raise DelegationError("Acknowledge this result from its originating Codex task.")
+    can_collect = not origin or os.environ.get("CODEX_THREAD_ID") == origin
+    if args.command == "ack" and not can_collect:
+        raise DelegationError("Acknowledge this result from its originating Codex task.")
     already_collected = False
-    if result["terminal"] and (args.command == "ack" or (args.command == "wait" and not args.event)):
-        already_collected = _collect_notification(receipt_dir)
+    if result["terminal"] and can_collect and (args.command == "ack" or (args.command == "wait" and not args.event)):
+        already_collected = _collect_result(receipt_dir, args.id)
+        _collect_notification(receipt_dir)
     suppress_replay = already_collected and not getattr(args, "replay", False)
     if (receipt_dir / "notification.json").is_file():
         result["notification"] = _read_json_object(receipt_dir / "notification.json")
+    if (receipt_dir / "collection.json").is_file():
+        result["collection"] = _read_json_object(receipt_dir / "collection.json")
     output = result
     if getattr(args, "event", False) or suppress_replay:
         output = {key: result[key] for key in ("delegation_id", "terminal", "status", "receipt_dir",
