@@ -14,10 +14,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 from typing import Any
 
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,7 @@ SKILL_SOURCE = (
 )
 DELEGATE_ENTRY_SOURCE = REPO_ROOT / "runtime" / "acpx_delegate_entry.cjs"
 HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode", "pi")
+PORTABLE_HOSTS = ("hermes", "opencode", "pi")
 RUNTIME_PACKAGES = ("acpx", "@agentclientprotocol/claude-agent-acp", "@agentclientprotocol/codex-acp")
 LEGACY_DEFAULT_CHAR_LIMITS = {
     "max_task_chars": 200000,
@@ -189,6 +191,39 @@ def _copy_skill(
         raise
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
+
+
+def _check_native_plugin(home: Path, host: str) -> None:
+    paths = {
+        "claude": home / ".claude/plugins/installed_plugins.json",
+        "codex": home / ".codex/config.toml",
+        "kimi": _skill_destination(home, "kimi").parents[1] / "plugins/installed.json",
+        "zcode": home / ".zcode/cli/plugins/installed_plugins.json",
+    }
+    path = paths.get(host)
+    if path is None or not path.is_file():
+        return
+    data = (tomllib.loads(path.read_text()) if path.suffix == ".toml"
+            else _read_json_object(path)).get("plugins", {})
+    names = data if isinstance(data, dict) else [item.get("id", "") for item in data]
+    if any(name.split("@")[0] == "agent-delegation" for name in names):
+        raise InstallError(f"{host} already owns agent-delegation as a plugin; update it through "
+                           "that host's plugin manager, not a second user Skill installation.")
+
+
+def _install_forwarder(share_root: Path, backup: Path, replace_existing: bool) -> Path:
+    # Keep the historical command path: ACPX named sessions use it as identity.
+    canonical = share_root / "skill"
+    entry = canonical / "scripts/agent_delegate.py"
+    if canonical.exists() and not entry.is_file():
+        raise InstallError(f"Unexpected legacy Skill layout: {canonical}")
+    if (canonical / "SKILL.md").exists():
+        if not _is_managed_skill(canonical) and not replace_existing:
+            raise InstallError(f"Unmanaged legacy Skill: {canonical}; review before replacement.")
+        _backup_item(canonical, backup / "skills/canonical")
+        shutil.rmtree(canonical)
+    _atomic_write_text(entry, (REPO_ROOT / "scripts/agent_delegate_forward.py").read_text(), 0o755)
+    return entry
 
 
 def _resolve_executable(home: Path, candidates: list[Path], names: list[str]) -> Path:
@@ -464,6 +499,8 @@ def _install(args: argparse.Namespace) -> int:
     target_names = _parse_hosts(args.targets) if args.targets is not None else hosts
     if not SKILL_SOURCE.is_dir():
         raise InstallError(f"Missing Skill source {SKILL_SOURCE}.")
+    for host in hosts:
+        _check_native_plugin(home, host)
     backup = _new_backup_dir(home, "install")
     share_root, runtime_root = _install_runtime(home, backup, args.replace_existing, args.update_runtime)
     # A runtime upgrade refreshes already managed adapter targets even when the
@@ -476,8 +513,7 @@ def _install(args: argparse.Namespace) -> int:
                     str(previous.get("provenance", "")).startswith("@agentclientprotocol/")):
                 target_names.append(name)
     targets = _build_managed_targets(home, runtime_root, target_names)
-    canonical_skill = share_root / "skill"
-    _copy_skill(canonical_skill, backup, "canonical", args.replace_existing)
+    forwarder = _install_forwarder(share_root, backup, args.replace_existing)
     for host in hosts:
         _copy_skill(
             _skill_destination(home, host),
@@ -491,7 +527,7 @@ def _install(args: argparse.Namespace) -> int:
     local_bin = home / ".local" / "bin"
     _install_symlink(
         local_bin / "agent-delegate",
-        canonical_skill / "scripts" / "agent_delegate.py",
+        forwarder,
         backup,
         args.replace_existing,
     )
@@ -532,7 +568,8 @@ def _doctor(args: argparse.Namespace) -> int:
         capture_output=True,
         timeout=120,
         check=False,
-        env={**os.environ, "AGENT_DELEGATION_HOME": str(home)},
+        env={**os.environ, "AGENT_DELEGATION_HOME": str(home),
+             "AGENT_DELEGATION_ENTRY": str(SKILL_SOURCE / "scripts/agent_delegate.py")},
     )
     sys.stdout.write(completed.stdout)
     sys.stderr.write(completed.stderr)
@@ -615,7 +652,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     install_parser = subparsers.add_parser("install")
-    install_parser.add_argument("--hosts", default=",".join(HOSTS))
+    install_parser.add_argument("--hosts", default=",".join(PORTABLE_HOSTS))
     install_parser.add_argument("--targets", help="ACP targets to configure; defaults to selected hosts. Use none for runtime/Skill only.")
     install_parser.add_argument("--replace-existing", action="store_true")
     install_parser.add_argument("--update-runtime", action="store_true",

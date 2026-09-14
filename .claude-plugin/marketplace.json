@@ -1,0 +1,13 @@
+{
+  "name": "rocky-agent-delegation",
+  "owner": {
+    "name": "rocky2431"
+  },
+  "plugins": [
+    {
+      "name": "agent-delegation",
+      "source": "./plugins/agent-delegation",
+      "description": "Delegate meaningful missions between ACP-compatible agents while preserving worker agency and receipt-backed effect boundaries."
+    }
+  ]
+}

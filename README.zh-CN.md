@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.6.1。
+版本：0.6.2。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -40,7 +40,7 @@ git clone https://github.com/rocky2431/agent-delegate-skill.git
 cd agent-delegate-skill
 ```
 
-如果六个受支持的 CLI 都已安装，可以一次安装并检查全部组件：
+默认安装 Hermes、OpenCode、Pi 的 portable Skill，并检查运行依赖：
 
 ```bash
 python3 scripts/install_user.py install
@@ -51,8 +51,8 @@ python3 scripts/install_user.py doctor
 
 ```bash
 python3 scripts/install_user.py install \
-  --hosts hermes,kimi \
-  --targets hermes,kimi
+  --hosts hermes,opencode \
+  --targets hermes,opencode
 ```
 
 Portable Skill 使用各宿主的原生用户目录：
@@ -65,6 +65,24 @@ Portable Skill 使用各宿主的原生用户目录：
 | Kimi Code | `$KIMI_CODE_HOME/skills/agent-delegation`（默认 `~/.kimi-code/skills/agent-delegation`） |
 | zCode | `~/.zcode/skills/agent-delegation` |
 | OpenCode | `~/.config/opencode/skills/agent-delegation` |
+
+### 每个宿主只保留一套
+
+Codex、Claude Code、Kimi Code、zCode 优先通过各自原生插件管理器安装、更新。
+Claude Code 和 zCode 使用本仓库 marketplace；Kimi Code 安装 `plugins/agent-delegation`。
+同一宿主已有插件时，用户安装器会拒绝写入第二份 Skill。迁移前先备份旧用户目录，
+再将旧副本移出 Skill 发现路径。
+
+模型执行已加载 `SKILL.md` 同目录下的 `scripts/agent_delegate.py`。
+以下简写命令 `agent-delegate` 只做转发；使用前在当前 shell 明确设置：
+
+```bash
+export AGENT_DELEGATION_ENTRY="/已加载的Skill绝对路径/scripts/agent_delegate.py"
+```
+
+没有指定入口时，直接用 `python3 "/已加载的Skill绝对路径/scripts/agent_delegate.py"`。
+旧共享 Skill 会备份后替换为同路径的转发入口，以保留 ACPX 命名会话身份；不再保存
+另一份 Skill 文档和 Python 实现。配置、回执、第三方依赖与独立 ACPX 编程接口仍保留。
 
 ### Codex plugin
 

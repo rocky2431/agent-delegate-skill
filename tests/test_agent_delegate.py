@@ -132,13 +132,15 @@ class AgentDelegateCliTests(unittest.TestCase):
         stable = self.bin / "native-current"
         stable.symlink_to(native)
         self.target.write_text("#!/usr/bin/env python3\nimport os, subprocess\n"
+                               "assert 'AGENT_DELEGATION_ENTRY' not in os.environ\n"
                                "print(subprocess.check_output([os.environ['CODEX_PATH'], '--version'], text=True).strip())\n")
         target = {"argv": [str(self.target)], "version_argv": ["/stale/standalone-cli", "--version"],
                   "cli_env": {"CODEX_PATH": str(stable)}}
         runtime_file = self.root / "runtime.json"
         env = {**self.environment, "CODEX_PATH": "/must-not-run-bundled-cli",
                "AGENT_DELEGATION_LAUNCH": json.dumps({"name": "beta", "target": target, "acpx_path": str(self.acpx)}),
-               "AGENT_DELEGATION_RUNTIME_RECEIPT": str(runtime_file)}
+               "AGENT_DELEGATION_RUNTIME_RECEIPT": str(runtime_file),
+               "AGENT_DELEGATION_ENTRY": str(SCRIPT)}
         result = self.run_cli("_launch", "--to", "beta", environment=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "native-v2")

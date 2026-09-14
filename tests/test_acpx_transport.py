@@ -20,6 +20,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "plugins/agent-delegation/skills/
 
 
 def serve_fixture() -> None:
+    assert "AGENT_DELEGATION_ENTRY" not in os.environ
     state = Path(os.environ["DELEGATION_FIXTURE_STATE"])
     output_lock = threading.Lock()
     cancelled = threading.Event()
@@ -193,9 +194,11 @@ class NativeTransportTests(unittest.TestCase):
 
             try:
                 legacy = run("fresh", session="legacy")
+                forwarder = root / "stable-launcher.py"
+                forwarder.write_bytes((Path(__file__).resolve().parents[1] / "scripts/agent_delegate_forward.py").read_bytes())
                 config = json.loads(registry.read_text())
                 config["targets"]["fixture"].update(
-                    launch_argv=[sys.executable, str(SCRIPT), "_launch", "--to", "fixture"],
+                    launch_argv=[sys.executable, str(forwarder), "_launch", "--to", "fixture"],
                     legacy_argv=[original_argv])
                 registry.write_text(json.dumps(config))
                 continued_legacy = run("continue", session="legacy")

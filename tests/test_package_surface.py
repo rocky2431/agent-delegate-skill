@@ -10,6 +10,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackageSurfaceTests(unittest.TestCase):
+    def test_native_manifests_share_one_skill_tree(self) -> None:
+        plugin = REPO_ROOT / "plugins/agent-delegation"
+        expected = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
+        for relative in (".claude-plugin/plugin.json", ".zcode-plugin/plugin.json", "kimi.plugin.json"):
+            manifest = json.loads((plugin / relative).read_text())
+            self.assertEqual(manifest["name"], expected["name"])
+            self.assertEqual(manifest["version"], expected["version"])
+        self.assertTrue((plugin / "skills/agent-delegation/SKILL.md").is_file())
+
     def test_plugin_and_marketplace_point_to_canonical_skill(self) -> None:
         plugin_root = REPO_ROOT / "plugins/agent-delegation"
         plugin = json.loads(

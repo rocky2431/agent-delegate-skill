@@ -2,9 +2,19 @@
 
 ## Runtime and target configuration
 
-The portable Skill is shared across hosts. Codex can receive it through the native
-plugin; other hosts use their user Skill directories. `agent-delegate` runs the
-canonical copy under `~/.local/share/agent-delegation/skill`.
+Each host owns one installation. Codex, Claude Code, Kimi Code, and zCode use
+their native plugin managers; portable hosts use one user Skill directory.
+Resolve `<skill-dir>` from the loaded `SKILL.md` and execute its bundled script.
+The optional `agent-delegate` compatibility command only forwards to the absolute
+`AGENT_DELEGATION_ENTRY` supplied by its caller. Without that context it fails
+with instructions instead of selecting an unrelated host's version.
+
+The historical `~/.local/share/agent-delegation/skill/scripts/agent_delegate.py`
+path contains only that forwarder, preserving ACPX named-session command identity.
+There is no shared `SKILL.md` or business implementation there. The bundled runner
+supplies its own entry to the launcher and removes it before starting the target
+host, whose subsequent delegations use that host's own loaded Skill. Active native
+sessions keep their existing process until restarted; updating files is not a hot swap.
 
 The wrapper registry is `~/.config/agent-delegation/config.json`. Its `targets`
 entries are the launch source: custom targets pass their exact argv to ACPX without
@@ -69,7 +79,7 @@ registered external ACP agent; no native subagent routing is involved.
 
 ### Claude Code and zCode
 
-Submit once. Start `agent-delegate wait --id <delegation_id>` through the host's
+Submit once. Start `python3 "<skill-dir>/scripts/agent_delegate.py" wait --id <delegation_id>` through the host's
 native Bash tool with `run_in_background: true`. Keep both the delegation ID and
 the host's background-task ID. The waiter remains attached to that background
 task and exits only when the real worker ends. Do not add `&`, detach the waiter,
@@ -92,7 +102,7 @@ Background process execution and starting a model turn are separate capabilities
 The official App Server interface documents `process/outputDelta` and
 `process/exited` for client-owned processes, and `turn/start` with `toolOutput` to
 start a turn from an external result. A client already connected to the server
-owning the originating thread can await `agent-delegate wait --id <id> --event`
+owning the originating thread can await `python3 "<skill-dir>/scripts/agent_delegate.py" wait --id <id> --event`
 and deliver that compact event through `turn/start`. Use the actual thread ID;
 retain its receipt and event ID for recovery and deduplication. The existing
 external worker and blocking observer are sufficient; a new process-control
@@ -120,7 +130,7 @@ For Codex hosts that consume their persistent message queue (including the
 Desktop version verified below):
 
 ```bash
-agent-delegate submit --caller codex --notify codex --to zcode \
+python3 "<skill-dir>/scripts/agent_delegate.py" submit --caller codex --notify codex --to zcode \
   --cwd /absolute/task/root --task-file /absolute/mission.md
 ```
 
@@ -158,8 +168,8 @@ notification state. To complete a saved pending notification, or retry a known
 failed delivery after correcting its cause:
 
 ```bash
-agent-delegate notify --id <delegation_id>
-agent-delegate notify --id <delegation_id> --retry
+python3 "<skill-dir>/scripts/agent_delegate.py" notify --id <delegation_id>
+python3 "<skill-dir>/scripts/agent_delegate.py" notify --id <delegation_id> --retry
 ```
 
 Both commands retain the saved destination even if invoked from another shell.
@@ -223,7 +233,7 @@ runtime until closed; their CLI identity is unverified without a startup record.
 For one task, including a queued task, use:
 
 ```bash
-agent-delegate cancel --id <delegation_id>
+python3 "<skill-dir>/scripts/agent_delegate.py" cancel --id <delegation_id>
 ```
 
 This requests cancellation only for that invocation; an old task ID cannot cancel
@@ -245,13 +255,13 @@ which unrelated/background processes should be terminated.
 Only when intentionally stopping a named session's active turn, use:
 
 ```bash
-agent-delegate cancel --to codex --cwd /absolute/task/root --session review
+python3 "<skill-dir>/scripts/agent_delegate.py" cancel --to codex --cwd /absolute/task/root --session review
 ```
 
 Only when that conversation is finished and no remaining task needs it, close it:
 
 ```bash
-agent-delegate close --to codex --cwd /absolute/task/root --session review
+python3 "<skill-dir>/scripts/agent_delegate.py" close --to codex --cwd /absolute/task/root --session review
 ```
 
 The OS releases a wrapper's session lock on exit. Direct native ACPX calls do not
@@ -307,7 +317,7 @@ an adapter cannot supply enough information to classify an event.
 ## Diagnose and recover
 
 ```bash
-agent-delegate doctor --to codex --json
+python3 "<skill-dir>/scripts/agent_delegate.py" doctor --to codex --json
 ```
 
 Doctor reports effective budgets and separates the configured CLI, adapter, and
@@ -354,7 +364,7 @@ registry and ACPX configuration and repoint the `acpx` command to that registry'
 Register an already installed ACP executable when the owner requests a new target:
 
 ```bash
-agent-delegate register --name example \
+python3 "<skill-dir>/scripts/agent_delegate.py" register --name example \
   --argv-json '["/absolute/path/example", "acp"]' \
   --observed-version '1.2.3' --provenance 'official package example@1.2.3'
 ```

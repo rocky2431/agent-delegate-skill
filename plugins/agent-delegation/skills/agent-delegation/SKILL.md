@@ -14,14 +14,14 @@ acceptance IDs and meanings, exclusions, prior failures, key corrections and gra
 authority. The worker reads those sources before reconstructing the task. No Task
 State, Deep Thinking or UltraGoal installation is required on either side.
 
-Use `agent-delegate list --json` if targets are unknown. Choose a target for its useful context, tools, or independent perspective; the same agent type can run another independent task.
+Resolve `<skill-dir>` to the absolute directory containing this loaded `SKILL.md`. Run its bundled script for every operation; do not discover another copy through PATH. Use `python3 "<skill-dir>/scripts/agent_delegate.py" list --json` if targets are unknown. Choose a target for its useful context, tools, or independent perspective; the same agent type can run another independent task.
 
 ## Submit and receive
 
 For ordinary delegation, submit once and keep the returned `delegation_id` with the task it identifies:
 
 ```bash
-agent-delegate submit --to codex \
+python3 "<skill-dir>/scripts/agent_delegate.py" submit --to codex \
   --cwd /absolute/task/root --task-file /absolute/mission.md
 ```
 
@@ -53,7 +53,7 @@ the existing worker lock, without periodic status reads. Replace `<delegation_id
 with the returned full ID:
 
 ```bash
-agent-delegate wait --id <delegation_id>
+python3 "<skill-dir>/scripts/agent_delegate.py" wait --id <delegation_id>
 ```
 
 Read the JSON on every return; a successful command exit is not task completion.
@@ -89,7 +89,7 @@ A delegation ID identifies one submitted task. A session name carries conversati
 When a specific task should stop, cancel its ID and then observe that ID until the outcome is known:
 
 ```bash
-agent-delegate cancel --id <delegation_id>
+python3 "<skill-dir>/scripts/agent_delegate.py" cancel --id <delegation_id>
 ```
 
 A cancellation acknowledgement is not proof that work stopped. Use task-ID cancellation for a queued task; session-wide cancellation targets the session's active turn. Cancellation and session closure are conditional controls, not routine result-collection steps. See [operations.md](references/operations.md) for synchronous `run`, session controls, receipts, and recovery.

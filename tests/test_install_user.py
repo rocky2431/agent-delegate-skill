@@ -4,8 +4,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,6 +22,43 @@ SPEC.loader.exec_module(install_user)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_legacy_path_forwards_to_each_loaded_package_without_a_shared_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            share = home / ".local/share/agent-delegation"
+            old = share / "skill"
+            (old / "scripts").mkdir(parents=True)
+            (old / "SKILL.md").write_text("old instructions")
+            (old / ".agent-delegation-managed.json").write_text('{"package":"agent-delegation"}')
+            (old / "scripts/agent_delegate.py").write_text("old implementation")
+            entry = install_user._install_forwarder(share, home / "backup", False)
+            self.assertFalse((old / "SKILL.md").exists())
+            self.assertEqual((home / "backup/skills/canonical/SKILL.md").read_text(), "old instructions")
+            env = {key: value for key, value in os.environ.items() if key != "AGENT_DELEGATION_ENTRY"}
+            missing = subprocess.run([sys.executable, str(entry)], env=env, capture_output=True, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("loaded agent-delegation Skill", missing.stderr)
+            for version in ("host-a-v1", "host-a-v2", "host-b-v1"):
+                script = home / version / "agent_delegate.py"
+                script.parent.mkdir()
+                script.write_text(f"print({version!r})\n")
+                result = subprocess.run([sys.executable, str(entry), "--version"],
+                    env={**env, "AGENT_DELEGATION_ENTRY": str(script)}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), version)
+
+    def test_native_plugin_blocks_a_second_user_skill_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            state = home / ".claude/plugins/installed_plugins.json"
+            state.parent.mkdir(parents=True)
+            state.write_text('{"plugins":{"agent-delegation@market":[{"scope":"user"}]}}')
+            args = install_user.argparse.Namespace(home=str(home), hosts="claude", targets="none",
+                replace_existing=True, update_runtime=False)
+            with self.assertRaisesRegex(install_user.InstallError, "already owns"):
+                install_user._install(args)
+            self.assertFalse((home / ".local").exists())
+
     def write_runtime(self, root: Path, version: str = "1.2.3") -> None:
         root.mkdir(parents=True, exist_ok=True)
         (root / "package-lock.json").write_text(json.dumps({"fixture": version}))

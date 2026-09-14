@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.6.1.
+Version: 0.6.2.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -43,7 +43,7 @@ git clone https://github.com/rocky2431/agent-delegate-skill.git
 cd agent-delegate-skill
 ```
 
-If all seven supported CLIs are installed, install everything and check it:
+For the default portable hosts (Hermes, OpenCode, Pi), install and check:
 
 ```bash
 python3 scripts/install_user.py install
@@ -54,11 +54,13 @@ To install only selected hosts and targets, pass comma-separated lists:
 
 ```bash
 python3 scripts/install_user.py install \
-  --hosts hermes,kimi \
-  --targets hermes,kimi
+  --hosts hermes,opencode \
+  --targets hermes,opencode
 ```
 
-The portable Skill is installed in these native user directories:
+Prefer native plugins for Codex, Claude Code, Kimi Code, and zCode. The following
+user directories remain available for portable-only installations; the installer
+refuses a second copy when that host already has the plugin:
 
 | Host | Skill directory |
 |---|---|
@@ -111,6 +113,28 @@ codex plugin marketplace add /absolute/path/to/agent-delegate-skill
 Do not enable both the portable Codex copy and the same named plugin. Codex may
 discover the Skill twice. `task-state-with-files` is a separate Skill and remains
 a separate installation.
+
+### One package per host
+
+Claude Code installs `agent-delegation@rocky-agent-delegation` from this repository's
+marketplace. Kimi Code installs `plugins/agent-delegation` through its native plugin
+manager; zCode uses the same marketplace and its `.zcode-plugin` manifest. Update
+through the same host manager. Do not also run the portable installer for that host.
+Before migration, back up and remove the old user Skill from discovery.
+
+Every command below denotes the script bundled with the loaded Skill. Set its
+absolute path once in the shell running the commands:
+
+```bash
+export AGENT_DELEGATION_ENTRY="/absolute/loaded/skill/scripts/agent_delegate.py"
+```
+
+`agent-delegate` is now only a compatibility forwarder to that entry. It does not
+pick a host or retain an independently updated implementation. Without an explicit
+entry, call `python3 "/absolute/loaded/skill/scripts/agent_delegate.py"` directly.
+The old shared Skill is backed up and replaced with this forwarder at the same
+command path, preserving existing ACPX named sessions. Configuration, receipts,
+third-party dependencies, and the separate public ACPX programming API remain shared.
 
 ### Reviewed targets
 
@@ -316,7 +340,8 @@ native session, and possible effects before retrying.
 
 ## Updates and removal
 
-An ordinary update refreshes the managed Skill and wrapper entry. It preserves
+Update native plugins through their host managers. A portable installer update
+refreshes selected portable Skills and the compatibility forwarder. It preserves
 the selected runtime, custom budgets, unselected targets, and old runtime
 generations used by warm sessions:
 

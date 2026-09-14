@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterable, Iterator
 import uuid
 
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -674,9 +674,11 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
     runtime_launch = launch.get("runtime_launch")
     child_env.pop("AGENT_DELEGATION_LAUNCH", None)
     child_env.pop("AGENT_DELEGATION_RUNTIME_RECEIPT", None)
+    child_env.pop("AGENT_DELEGATION_ENTRY", None)
     if runtime_launch:
         child_env.update(runtime_launch["target"].get("cli_env", {}))
         if launch.get("use_launcher", "_launch" in selected_argv):
+            child_env["AGENT_DELEGATION_ENTRY"] = str(Path(__file__).resolve())
             child_env["AGENT_DELEGATION_LAUNCH"] = json.dumps(runtime_launch)
             child_env["AGENT_DELEGATION_RUNTIME_RECEIPT"] = str(runtime_file)
     state = _read_json_object(receipt_dir / "state.json")
@@ -1073,6 +1075,7 @@ def _launch(args: argparse.Namespace) -> int:
     env = dict(os.environ)
     receipt = env.pop("AGENT_DELEGATION_RUNTIME_RECEIPT", None)
     env.pop("AGENT_DELEGATION_LAUNCH", None)
+    env.pop("AGENT_DELEGATION_ENTRY", None)
     argv = [str(Path(target["argv"][0]).resolve()), *target["argv"][1:]]
     for key, value in target.get("cli_env", {}).items():
         path = Path(value).resolve()
