@@ -63,6 +63,10 @@ class PackageSurfaceTests(unittest.TestCase):
         package = json.loads((REPO_ROOT / "runtime/package.json").read_text(encoding="utf-8"))
         lock = json.loads((REPO_ROOT / "runtime/package-lock.json").read_text(encoding="utf-8"))
         expected = {
+            "zcode-acp-server": (
+                "0.46.6",
+                "sha512-r2uUItqcQhzPDJ8ckRxJvEocThWW7+ObjN9/wTz7M6b5+RSbeIOdtoUL1RCmJ44FxfpJIAIGEeY3uoAYbLBpTg==",
+            ),
             "pi-acp": ('0.0.33', 'sha512-vX9kY1tK14E72G4dBAx+RGCk/k7XPjTHls6dLUxA8WSkBav6B6JHuSBv3eusp50LCR/GTRsR2kIKsG0Z5jANzw=='),
             "acpx": (
                 "0.13.2",

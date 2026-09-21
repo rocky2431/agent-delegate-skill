@@ -407,10 +407,54 @@ Version drift and unavailable version probes are informational. A missing bound
 CLI or adapter is an actionable failure; fix that target or configuration layer.
 Do not treat an unrelated target warning as a global startup prohibition.
 
-Repair authentication directly through the provider. The managed ZCode adapter's
-`--no-browser` avoids unattended OAuth/device login; it does not disable ordinary
-web tools. Normal task execution does not download a replacement runtime or use
-`npx -y`.
+Repair authentication directly through the provider. Normal task execution does
+not download a replacement runtime or use `npx -y`.
+
+## zCode runtime
+
+The official local CLI inspected on 2026-09-21 (0.16.9) exposes ZCode Protocol
+`app-server`, not an ACP subcommand. The managed target uses the maintained
+[community zcode-acp-server bridge](https://github.com/william0wang/zcode-acp).
+Its implementation remains an npm dependency; the Skill owns discovery,
+installation, launch identity, and diagnostics. See the bridge's
+[provider/bootstrap troubleshooting](https://github.com/william0wang/zcode-acp/blob/main/docs/TROUBLESHOOTING.md).
+This observation is not a claim about every past or future official release.
+
+```bash
+python3 scripts/install_user.py install --hosts none --targets zcode --update-zcode-adapter
+python3 "<skill-dir>/scripts/agent_delegate.py" doctor --to zcode --json
+```
+
+The explicit zCode upgrade resolves the current npm release, saves its exact
+version and lockfile in a new generation, and preserves other existing dependency
+versions. The repository lockfile records the tested snapshot. Ordinary Skill
+updates preserve the installed bridge; runtime execution does not fetch packages.
+The old runtime and external adapters are retained for existing sessions or rollback.
+
+Each new process resolves the CLI from `ZCODE_BIN` (legacy
+`ZCODE_ACP_ZCODE_PATH` is accepted), then `zcode` on PATH, then macOS bundle metadata.
+No application directory, CLI version, or Node installation directory is assumed.
+Ambiguous/missing installations fail with an explicit override instruction.
+`ZCODE_NODE` (legacy `ZCODE_ACP_NODE`) selects Node; otherwise PATH supplies it.
+The bridge resolves provider files beside the selected CLI, including both built-in
+and personal tables required by its account protocol. A CLI upgrade is followed on
+new launches; an already running session keeps its existing process.
+
+The account root is `ZCODE_HOME`, or `ZCODE_DATA_BASE_DIR/.zcode`, or `~/.zcode`.
+The current native backend requires a root ending in `.zcode`; conflicting roots
+are rejected rather than silently selecting another account. The configured model
+comes from that account's `v2/provider_config.json` default selection, then
+`cli/config.json` legacy selection. Set both `ZCODE_PROVIDER` and `ZCODE_MODEL`
+to override explicitly. No fixed provider/model or first-enabled-model fallback
+is selected. The bridge maps legacy IDs using the current native model catalog.
+Credentials remain in zCode's own configuration.
+
+Doctor checks native `startup/storageState` readiness without creating a session
+or sending a model request: `--version` and exit status alone miss a known startup
+failure. Doctor does not prove authentication or model completion. The startup
+receipt records the actual CLI, adapter, Node, account root, and requested model.
+A live test of bridge 0.46.6 with CLI 0.16.9 completed a configured-model request;
+other CLI/bridge combinations require their own verification, not version branches.
 
 ## Install and register
 
@@ -433,7 +477,7 @@ under `~/.local/share/agent-delegation/runtimes/`. It records installed versions
 the lock hash before updating the registry and command links. Failed installation
 leaves the previous runtime selected. Old directories are retained for active
 processes, legacy sessions, and rollback. An explicit runtime upgrade also refreshes
-previously managed Codex/Claude adapter targets even if those Skill hosts are not
+previously managed Codex/Claude/Pi/zCode adapter targets even if those Skill hosts are not
 selected. Custom targets remain unchanged.
 
 The repository's `runtime/package-lock.json` is a reproducible development/test

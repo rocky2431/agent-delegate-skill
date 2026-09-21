@@ -23,8 +23,11 @@ import time
 from typing import Any, Callable, Iterable, Iterator
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import zcode_runtime
 
-VERSION = "0.6.4"
+
+VERSION = "0.7.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -164,6 +167,11 @@ def _validate_target_record(name: object, target: object) -> None:
     if not isinstance(cli_env, dict) or any(key not in ("CODEX_PATH", "CLAUDE_CODE_EXECUTABLE", "PI_ACP_PI_COMMAND") or
             not isinstance(value, str) or not Path(value).is_absolute() for key, value in cli_env.items()):
         raise DelegationError(f"Target {name!r} cli_env must bind native CLI variables to absolute paths.")
+    if "zcode_runtime" in target and target["zcode_runtime"] is not True:
+        raise DelegationError(f"Target {name!r} zcode_runtime must be true when selected.")
+    if target.get("zcode_runtime") and (len(argv) < 2 or
+            target.get("adapter_path") != argv[1] or not Path(argv[1]).is_absolute()):
+        raise DelegationError(f"Target {name!r} must bind its zCode adapter_path to argv[1].")
 
 
 def _target(registry: dict[str, Any], name: str) -> dict[str, Any]:
@@ -600,7 +608,7 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
         request["origin_thread_id"] = os.environ["CODEX_THREAD_ID"]
     # Only public launch metadata travels in the receipt, never ambient secrets.
     runtime_launch = {"name": args.to, "acpx_path": registry["acpx_path"], "target": {
-        key: target[key] for key in ("argv", "version_argv", "cli_path", "cli_env", "adapter_package", "adapter_version_argv") if key in target}}
+        key: target[key] for key in ("argv", "version_argv", "cli_path", "cli_env", "adapter_package", "adapter_path", "adapter_version_argv", "zcode_runtime") if key in target}}
     runtime_launch["target"]["argv"] = request["target_argv"]
     return registry, {"request": request, "commands": commands, "max_result_chars": max_result_chars,
                       "runtime_launch": runtime_launch, "use_launcher": selected_argv == target.get("launch_argv")}
@@ -1188,13 +1196,14 @@ def _runtime_identity(target: dict[str, Any], acpx: str, probe: bool = True) -> 
             cli.update(version=detail if ok else None, probe_ok=ok, probe_error=None if ok else detail)
     adapter = None
     if target.get("adapter_package"):
-        adapter = _package_identity(target["argv"][0], target["adapter_package"])
+        adapter = _package_identity(target.get("adapter_path", target["argv"][0]), target["adapter_package"])
     elif (argv := _cli_version_argv({"version_argv": target.get("adapter_version_argv")})):
         ok, detail = _run_version_probe(argv) if probe else (False, None)
         adapter = {"path": argv[0], "version": detail if ok else None}
     return {"observation": "configured", "acpx": _package_identity(acpx, "acpx"),
             "adapter": adapter, "cli": cli, "cli_binding": target.get("cli_env", {}),
-            "target_argv": target["argv"]}
+            "target_argv": target["argv"],
+            **({key: target[key] for key in ("zcode_paths", "zcode_model") if key in target})}
 
 
 def _launch(args: argparse.Namespace) -> int:
@@ -1215,6 +1224,11 @@ def _launch(args: argparse.Namespace) -> int:
     receipt = env.pop("AGENT_DELEGATION_RUNTIME_RECEIPT", None)
     env.pop("AGENT_DELEGATION_LAUNCH", None)
     env.pop("AGENT_DELEGATION_ENTRY", None)
+    if target.get("zcode_runtime"):
+        try:
+            target, env = zcode_runtime.prepare(target, env)
+        except zcode_runtime.ZCodeRuntimeError as exc:
+            raise DelegationError(str(exc)) from exc
     argv = [str(Path(target["argv"][0]).resolve()), *target["argv"][1:]]
     for key, value in target.get("cli_env", {}).items():
         path = Path(value).resolve()
@@ -1249,7 +1263,11 @@ def _doctor(args: argparse.Namespace) -> int:
     for name in names:
         try:
             target = _target(registry, name)
-        except DelegationError as exc:
+            if target.get("zcode_runtime"):
+                target, zcode_env = zcode_runtime.prepare(target, dict(os.environ))
+                ready, detail = zcode_runtime.probe(target, zcode_env)
+                checks.append({"check": f"target:{name}:app_server_ready", "ok": ready, "detail": detail})
+        except (DelegationError, zcode_runtime.ZCodeRuntimeError) as exc:
             checks.append({"check": f"target:{name}:record", "ok": False, "detail": str(exc)})
             continue
         executable = Path(target["argv"][0])

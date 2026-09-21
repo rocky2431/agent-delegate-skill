@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.6.4.
+Version: 0.7.0.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -68,9 +68,21 @@ refuses a second copy when that host already has the plugin:
 | Claude Code | `~/.claude/skills/agent-delegation` |
 | Codex portable discovery | `~/.agents/skills/agent-delegation` |
 | Kimi Code | `$KIMI_CODE_HOME/skills/agent-delegation` (default `~/.kimi-code/skills/agent-delegation`) |
-| zCode | `~/.zcode/skills/agent-delegation` |
+| zCode | `$ZCODE_HOME/skills/agent-delegation` (default `~/.zcode/skills/agent-delegation`) |
 | OpenCode | `~/.config/opencode/skills/agent-delegation` |
 | Pi | `$PI_CODING_AGENT_DIR/skills/agent-delegation` (default `~/.pi/agent/skills/agent-delegation`) |
+
+### zCode
+
+```bash
+python3 scripts/install_user.py install --hosts none --targets zcode --update-zcode-adapter
+```
+
+This stages the maintained [community ACP bridge](https://github.com/william0wang/zcode-acp)
+in a new runtime generation, preserving other dependency versions and the previous
+runtime. The official CLI supplies `app-server`; this bridge supplies ACP.
+Keep the native zCode plugin as the Skill installation. Configure authentication
+and a model in zCode first; the wrapper never guesses a fallback model.
 
 ### Pi
 
@@ -144,13 +156,14 @@ third-party dependencies, and the separate public ACPX programming API remain sh
 | Claude Code | `claude-agent-acp`, bound to the local `claude` executable |
 | Codex | `codex-acp`, bound to the local `codex` executable |
 | Kimi Code | `kimi acp` |
-| zCode | the installed `zcode-acp` bridge |
+| zCode | managed `zcode-acp-server` → the discovered local ZCode `app-server` |
 | OpenCode | `opencode acp` |
 | Pi | `pi-acp` → the bound local `pi --mode rpc` |
 
 Managed targets keep their normal model, authentication, tools, and plugin
-configuration. The zCode entry uses `--no-browser` to prevent an unattended
-OAuth or device-login prompt. It does not disable ordinary network or web tools.
+configuration. zCode resolves the installed CLI, account directory, and configured
+model when a new adapter process starts. No CLI release or application location
+is embedded in the target. See the [zCode runtime guide](plugins/agent-delegation/skills/agent-delegation/references/operations.md#zcode-runtime).
 
 List the targets available in the current installation:
 

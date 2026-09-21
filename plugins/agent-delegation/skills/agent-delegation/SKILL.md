@@ -158,3 +158,5 @@ evidence is `incomplete`. A native model error is not successful delegation.
 There is no default task/result character cap. Timeout and depth come from the registry; `doctor --to <target> --json` shows effective limits and target health. Run it when diagnosing a failure, not as a mandatory gate before each delegation.
 
 Managed targets use the installed local CLI; Codex and Claude adapters bind it explicitly. `runtime_identity` separates CLI, adapter, and ACPX versions observed at startup. A warm session may still use its earlier process. A legacy session without a startup record is marked unverified. Ordinary Skill updates preserve the installed runtime; an explicit `install --update-runtime` upgrades it. See [operations.md](references/operations.md) for update and recovery details.
+
+The managed zCode target uses `zcode-acp-server` over the local CLI app-server. It resolves the CLI, account, and configured model at startup; it never guesses a fallback model. Use `install --update-zcode-adapter --targets zcode` for a targeted bridge update. See [zCode runtime](references/operations.md#zcode-runtime) for discovery overrides and readiness diagnostics.

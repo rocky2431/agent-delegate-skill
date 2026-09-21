@@ -110,6 +110,38 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(registry_path.read_bytes(), registry_before)
             self.assertEqual((old / "package-lock.json").read_bytes(), lock_before)
 
+    def test_zcode_only_update_preserves_other_dependency_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            share = home / ".local/share/agent-delegation"
+            old = share / "runtime"
+            self.write_runtime(old)
+            (old / "package.json").write_text(json.dumps({"dependencies": {"acpx": "1.2.3"}}))
+            (share / ".managed.json").write_text('{"package":"agent-delegation"}')
+            registry = home / ".config/agent-delegation/config.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(json.dumps({"runtime_root": str(old)}))
+            before = (old / "package-lock.json").read_bytes()
+
+            def install(argv, **kwargs):
+                self.assertEqual(argv[-1], "zcode-acp-server@latest")
+                self.assertNotIn("acpx@latest", argv)
+                root = kwargs["cwd"]
+                self.assertEqual(json.loads((root / "package.json").read_text())["dependencies"], {"acpx": "1.2.3"})
+                self.write_runtime(root)
+                package = root / "node_modules/zcode-acp-server"
+                package.mkdir()
+                (package / "package.json").write_text('{"version":"future-adapter"}')
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with patch.object(install_user, "_version_line", return_value="v24.0.0"), \
+                 patch.object(install_user.subprocess, "run", side_effect=install):
+                _, new = install_user._install_runtime(home, home / "backup", False, update_zcode_adapter=True)
+            self.assertEqual(install_user._runtime_versions(new)["acpx"], "1.2.3")
+            self.assertEqual(install_user._runtime_versions(new)["zcode-acp-server"], "future-adapter")
+            self.assertEqual((old / "package-lock.json").read_bytes(), before)
+            self.assertEqual(json.loads(registry.read_text())["runtime_root"], str(old))
+
     def test_native_cli_binding_and_launcher_survive_runtime_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -149,17 +181,38 @@ class InstallerTests(unittest.TestCase):
             stable.symlink_to(executable)
             self.assertEqual(install_user._resolve_executable(home, [stable], []), stable)
 
-    def test_zcode_adapter_keeps_existing_timeout_budget(self) -> None:
+    def test_zcode_uses_managed_adapter_without_baked_cli_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             registry = home / ".config/agent-delegation/config.json"
             registry.parent.mkdir(parents=True)
             registry.write_text(json.dumps({"max_timeout_seconds": 43200}))
+            adapter = home / "runtime/node_modules/zcode-acp-server/dist/index.js"
+            adapter.parent.mkdir(parents=True)
+            adapter.write_text("// fixture")
             with patch.object(install_user, "_resolve_executable", return_value=home / "cli"), \
                  patch.object(install_user, "_version_line", return_value="fixture"), \
-                 patch.object(Path, "is_file", return_value=True):
-                argv = install_user._build_managed_targets(home, home / "runtime", ["zcode"])["zcode"]["argv"]
-            self.assertEqual(argv[argv.index("--prompt-timeout-secs") + 1], "43200")
+                 patch.object(install_user.zcode_runtime, "prepare", return_value=(
+                     {"version_argv": [str(home / "discovered-node"), str(home / "discovered-cli"), "--version"]}, {})):
+                target = install_user._build_managed_targets(home, home / "runtime", ["zcode"])["zcode"]
+                argv = target["argv"]
+            self.assertEqual(argv[1], str(adapter))
+            self.assertEqual(json.loads(registry.read_text())["max_timeout_seconds"], 43200)
+            self.assertTrue(target["zcode_runtime"])
+            self.assertNotIn("--zcode-path", argv)
+            self.assertNotIn("--node", argv)
+
+    def test_zcode_data_root_controls_skill_and_plugin_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            data = home / "custom account"
+            with patch.dict(os.environ, {"ZCODE_DATA_BASE_DIR": str(data)}):
+                self.assertEqual(install_user._skill_destination(home, "zcode"), data.resolve() / ".zcode/skills/agent-delegation")
+                state = data / ".zcode/cli/plugins/installed_plugins.json"
+                state.parent.mkdir(parents=True)
+                state.write_text('{"plugins":[{"id":"agent-delegation@market"}]}')
+                with self.assertRaisesRegex(install_user.InstallError, "already owns"):
+                    install_user._check_native_plugin(home, "zcode")
 
     def test_host_destinations_are_native_user_paths(self) -> None:
         home = Path("/tmp/example-home")
@@ -168,7 +221,7 @@ class InstallerTests(unittest.TestCase):
             "claude": home / ".claude/skills/agent-delegation",
             "codex": home / ".agents/skills/agent-delegation",
             "kimi": home / ".kimi-code/skills/agent-delegation",
-            "zcode": home / ".zcode/skills/agent-delegation",
+            "zcode": home.resolve() / ".zcode/skills/agent-delegation",
             "opencode": home / ".config/opencode/skills/agent-delegation",
             "pi": home / ".pi/agent/skills/agent-delegation",
         }

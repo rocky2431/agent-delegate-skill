@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.6.4。
+版本：0.7.0。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -63,7 +63,7 @@ Portable Skill 使用各宿主的原生用户目录：
 | Claude Code | `~/.claude/skills/agent-delegation` |
 | Codex portable discovery | `~/.agents/skills/agent-delegation` |
 | Kimi Code | `$KIMI_CODE_HOME/skills/agent-delegation`（默认 `~/.kimi-code/skills/agent-delegation`） |
-| zCode | `~/.zcode/skills/agent-delegation` |
+| zCode | `$ZCODE_HOME/skills/agent-delegation`（默认 `~/.zcode/skills/agent-delegation`） |
 | OpenCode | `~/.config/opencode/skills/agent-delegation` |
 
 ### 每个宿主只保留一套
@@ -112,12 +112,20 @@ Skill。 `task-state-with-files` 是另一项独立 Skill，需要单独安装�
 | Claude Code | `claude-agent-acp`，绑定本机 `claude` executable |
 | Codex | `codex-acp`，绑定本机 `codex` executable |
 | Kimi Code | `kimi acp` |
-| zCode | 已安装的 `zcode-acp` bridge |
+| zCode | 托管的 `zcode-acp-server` → 动态发现的本机 ZCode `app-server` |
 | OpenCode | `opencode acp` |
 
-托管目标继续使用自己的模型、认证、工具和 plugin 配置。zCode 入口使用
-`--no-browser`，避免无人值守运行时出现 OAuth 或设备登录界面。这个参数
-不会关闭普通网络或 Web 工具。
+托管目标继续使用自己的模型、认证、工具和 plugin 配置。zCode 每次启动新的
+适配器进程时发现 CLI、账号目录和已配置模型，不写死应用位置或 CLI 版本。
+
+```bash
+python3 scripts/install_user.py install --hosts none --targets zcode --update-zcode-adapter
+```
+
+这个命令将维护中的[社区 ACP bridge](https://github.com/william0wang/zcode-acp)
+安装到新 runtime，保留其他依赖版本和旧 runtime。官方 CLI 提供 `app-server`，
+bridge 提供 ACP。先在 zCode 配置认证和模型；未配置时明确报错，不猜默认模型。
+路径覆盖、诊断和更新方式见 [zCode runtime](plugins/agent-delegation/skills/agent-delegation/references/operations.md#zcode-runtime)。
 
 查看当前安装中可用的目标：
 

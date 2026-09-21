@@ -18,7 +18,7 @@ import tomllib
 from typing import Any
 
 
-VERSION = "0.6.4"
+VERSION = "0.7.0"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +29,9 @@ SKILL_SOURCE = (
     / "skills"
     / "agent-delegation"
 )
+sys.path.insert(0, str(SKILL_SOURCE / "scripts"))
+import zcode_runtime
+
 DELEGATE_ENTRY_SOURCE = REPO_ROOT / "runtime" / "acpx_delegate_entry.cjs"
 HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode", "pi")
 PORTABLE_HOSTS = ("hermes", "opencode", "pi")
@@ -44,12 +47,13 @@ class InstallError(RuntimeError):
 
 
 def _skill_destination(home: Path, host: str) -> Path:
+    if host == "zcode":
+        return zcode_runtime.data_home(dict(os.environ), home) / "skills/agent-delegation"
     roots = {
         "hermes": home / ".hermes" / "skills",
         "claude": home / ".claude" / "skills",
         "codex": home / ".agents" / "skills",
         "kimi": Path(os.environ.get("KIMI_CODE_HOME") or home / ".kimi-code").expanduser() / "skills",
-        "zcode": home / ".zcode" / "skills",
         "opencode": home / ".config" / "opencode" / "skills",
         "pi": Path(os.environ.get("PI_CODING_AGENT_DIR") or home / ".pi/agent").expanduser() / "skills",
     }
@@ -198,9 +202,9 @@ def _check_native_plugin(home: Path, host: str) -> None:
         "claude": home / ".claude/plugins/installed_plugins.json",
         "codex": home / ".codex/config.toml",
         "kimi": _skill_destination(home, "kimi").parents[1] / "plugins/installed.json",
-        "zcode": home / ".zcode/cli/plugins/installed_plugins.json",
     }
-    path = paths.get(host)
+    path = (_skill_destination(home, "zcode").parents[1] / "cli/plugins/installed_plugins.json"
+            if host == "zcode" else paths.get(host))
     if path is None or not path.is_file():
         return
     data = (tomllib.loads(path.read_text()) if path.suffix == ".toml"
@@ -261,8 +265,8 @@ def _version_line(argv: list[str]) -> str:
 
 def _runtime_versions(runtime_root: Path) -> dict[str, str]:
     versions = {}
-    for name in (*RUNTIME_PACKAGES, "pi-acp"):
-        if name == "pi-acp" and not (runtime_root / "node_modules/pi-acp/package.json").exists():
+    for name in (*RUNTIME_PACKAGES, "pi-acp", "zcode-acp-server"):
+        if name not in RUNTIME_PACKAGES and not (runtime_root / "node_modules" / name / "package.json").exists():
             continue
         version = _read_json_object(runtime_root / "node_modules" / name / "package.json").get("version")
         if not isinstance(version, str) or not version:
@@ -285,7 +289,7 @@ def _install_delegate_entry(runtime_root: Path, backup: Path) -> Path:
 
 
 def _install_runtime(home: Path, backup: Path, replace_existing: bool,
-                     update_runtime: bool = False) -> tuple[Path, Path]:
+                     update_runtime: bool = False, update_zcode_adapter: bool = False) -> tuple[Path, Path]:
     share_root = home / ".local" / "share" / "agent-delegation"
     marker_path = share_root / ".managed.json"
     if share_root.exists() and not marker_path.exists() and not replace_existing:
@@ -294,7 +298,7 @@ def _install_runtime(home: Path, backup: Path, replace_existing: bool,
         )
     registry = _read_json_object(home / ".config/agent-delegation/config.json")
     existing_root = Path(registry.get("runtime_root", share_root / "runtime"))
-    if existing_root.is_dir() and not update_runtime:
+    if existing_root.is_dir() and not update_runtime and not update_zcode_adapter:
         # Skill updates never run npm against an existing runtime, even when it is
         # incomplete. An explicit update stages a replacement without touching it.
         # The reviewed delegate entry still refreshes beside the selected SDK.
@@ -322,12 +326,20 @@ def _install_runtime(home: Path, backup: Path, replace_existing: bool,
     generations.mkdir(parents=True, exist_ok=True)
     runtime_root = Path(tempfile.mkdtemp(prefix=datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-"), dir=generations))
     try:
-        _atomic_write_json(runtime_root / "package.json", {
-            "name": "agent-delegation-runtime", "version": VERSION, "private": True,
-        }, 0o644)
+        if update_zcode_adapter and existing_root.is_dir() and not update_runtime:
+            for name in ("package.json", "package-lock.json"):
+                shutil.copy2(existing_root / name, runtime_root / name)
+            packages = ["zcode-acp-server@latest"]
+        else:
+            _atomic_write_json(runtime_root / "package.json", {
+                "name": "agent-delegation-runtime", "version": VERSION, "private": True,
+            }, 0o644)
+            packages = [*[name + "@latest" for name in RUNTIME_PACKAGES], "pi-acp@0.0.33"]
+            if update_zcode_adapter or (existing_root / "node_modules/zcode-acp-server").is_dir():
+                packages.append("zcode-acp-server@latest")
         completed = subprocess.run(
             [npm, "install", "--save-exact", "--ignore-scripts", "--no-audit", "--no-fund",
-             *[name + "@latest" for name in RUNTIME_PACKAGES], "pi-acp@0.0.33"],
+             *packages],
             cwd=runtime_root, text=True, capture_output=True, timeout=300, check=False,
         )
         if completed.returncode != 0:
@@ -359,12 +371,12 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
     candidates = {
         "hermes": home / ".local/bin/hermes", "claude": home / ".local/bin/claude",
         "codex": home / ".local/bin/codex", "kimi": home / ".kimi-code/bin/kimi",
-        "zcode": home / ".local/bin/zcode-acp", "opencode": home / ".opencode/bin/opencode",
+        "opencode": home / ".opencode/bin/opencode",
         "pi": home / ".local/bin/pi",
     }
     for name in names:
-        command = "zcode-acp" if name == "zcode" else name
-        executable = _resolve_executable(home, [candidates[name]], [command])
+        executable = (_resolve_executable(home, [], [os.environ.get("ZCODE_NODE") or os.environ.get("ZCODE_ACP_NODE") or "node"]) if name == "zcode"
+                      else _resolve_executable(home, [candidates[name]], [name]))
         argv = [str(executable), "acp"]
         provenance = f"existing local {name} installation with native ACP"
         if name in ("claude", "codex"):
@@ -381,13 +393,10 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
             argv = [str(adapter)]
             provenance = "pi-acp bridging the existing local Pi CLI through RPC"
         elif name == "zcode":
-            bundle = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
-            if not bundle.is_file():
-                raise InstallError(f"ZCode CLI bundle is missing: {bundle}")
-            node = _resolve_executable(home, [], ["node"])
-            registry = _read_json_object(home / ".config/agent-delegation/config.json")
-            argv = [str(executable), "--zcode-path", str(bundle), "--node", str(node),
-                    "--prompt-timeout-secs", str(registry.get("max_timeout_seconds", MAX_TIMEOUT_SECONDS)), "--no-browser"]
+            adapter = runtime_root / "node_modules/zcode-acp-server/dist/index.js"
+            if not adapter.is_file():
+                raise InstallError("Managed zCode ACP adapter is missing; use install --update-zcode-adapter --targets zcode")
+            argv = [str(executable), str(adapter)]
         targets[name] = {"argv": argv, "version_argv": [str(executable), "--version"],
                          "observed_version": _version_line([str(executable), "--version"]),
                          "provenance": provenance,
@@ -402,10 +411,13 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
             targets[name].update(cli_env={"PI_ACP_PI_COMMAND": str(executable)},
                                  adapter_package="pi-acp", native_local_tools=True)
         elif name == "zcode":
-            targets[name]["version_argv"] = [str(node), str(bundle), "--version"]
-            targets[name]["cli_path"] = str(bundle)
-            targets[name]["observed_version"] = _version_line(targets[name]["version_argv"])
-            targets[name]["adapter_version_argv"] = [str(executable), "--version"]
+            targets[name]["zcode_runtime"] = True
+            targets[name]["adapter_package"] = "zcode-acp-server"
+            targets[name]["adapter_path"] = str(adapter)
+            resolved, _ = zcode_runtime.prepare(targets[name], dict(os.environ))
+            targets[name].pop("version_argv")
+            targets[name]["observed_version"] = _version_line(resolved["version_argv"])
+            targets[name]["provenance"] = "managed zcode-acp-server; ZCode resources and model resolved at each new launch"
     return targets
 
 
@@ -502,12 +514,15 @@ def _install(args: argparse.Namespace) -> int:
     for host in hosts:
         _check_native_plugin(home, host)
     backup = _new_backup_dir(home, "install")
-    share_root, runtime_root = _install_runtime(home, backup, args.replace_existing, args.update_runtime)
+    update_zcode = getattr(args, "update_zcode_adapter", False)
+    share_root, runtime_root = _install_runtime(home, backup, args.replace_existing, args.update_runtime, update_zcode)
+    if update_zcode and "zcode" not in target_names:
+        target_names.append("zcode")
     # A runtime upgrade refreshes already managed adapter targets even when the
     # selected Skill hosts exclude them; custom registrations are left alone.
     if args.update_runtime:
         existing_targets = _read_json_object(home / ".config/agent-delegation/config.json").get("targets", {})
-        for name in ("claude", "codex", "pi"):
+        for name in ("claude", "codex", "pi", "zcode"):
             previous = existing_targets.get(name, {})
             if name not in target_names and (previous.get("adapter_package") or
                     str(previous.get("provenance", "")).startswith("@agentclientprotocol/")):
@@ -547,6 +562,7 @@ def _install(args: argparse.Namespace) -> int:
         "acpx_config": str(acpx_config),
         "runtime_root": str(runtime_root),
         "runtime_updated": args.update_runtime,
+        "zcode_adapter_updated": update_zcode,
         "runtime_packages": registry["runtime_packages"],
         "runtime_lock_sha256": registry["runtime_lock_sha256"],
         "targets": sorted(targets),
@@ -657,6 +673,8 @@ def _build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--replace-existing", action="store_true")
     install_parser.add_argument("--update-runtime", action="store_true",
                                 help="Install current stable npm releases in a new directory; retain the old runtime.")
+    install_parser.add_argument("--update-zcode-adapter", action="store_true",
+                                help="Stage the current zCode ACP adapter; preserve other dependency versions and the old runtime.")
     install_parser.set_defaults(handler=_install)
 
     doctor_parser = subparsers.add_parser("doctor")
@@ -673,7 +691,7 @@ def main() -> int:
     args = _build_parser().parse_args()
     try:
         return int(args.handler(args))
-    except InstallError as exc:
+    except (InstallError, zcode_runtime.ZCodeRuntimeError) as exc:
         print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stderr)
         return 2
 
