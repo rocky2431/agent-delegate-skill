@@ -410,6 +410,41 @@ Do not treat an unrelated target warning as a global startup prohibition.
 Repair authentication directly through the provider. Normal task execution does
 not download a replacement runtime or use `npx -y`.
 
+## Kimi runtime
+
+Kimi provides native ACP through `kimi acp`; no third-party bridge is needed.
+Register the target without creating a second native-host Skill copy:
+
+```bash
+python3 scripts/install_user.py install --hosts none --targets kimi
+```
+
+The installer uses `kimi` on PATH before the standard user-install fallback. An
+explicitly registered custom argv remains the launch authority until the owner
+chooses to register it again. Stable symlinks are retained at registration and
+resolved when a new process starts. CLI versions are observations, not selection
+rules. `KIMI_CODE_HOME` remains the native data/configuration root and controls
+portable Skill and plugin discovery; it does not select the binary directory.
+
+The managed target sets `native_fs: true`, passing upstream ACPX `--no-fs`.
+Kimi then uses its existing filesystem implementation for instruction discovery
+and tools. This preserves the requested cwd and native parent/child instruction
+precedence without copying instructions into a second prompt or widening ACPX's
+filesystem root. See [Kimi ACP](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp)
+and the [native filesystem fallback](https://github.com/MoonshotAI/kimi-code/blob/main/packages/acp-server/src/acp-fs/acpFsService.ts).
+
+Native filesystem access is not bounded by ACPX's cwd subtree. The wrapper rejects
+`approve-reads`, `deny-all`, and `--no-terminal` for this managed target instead of
+claiming client restrictions govern native tools. Existing host permission policy
+and mission authority still apply. `runtime_identity.native_fs` records the launch
+selection; warm sessions keep their previous initialized capabilities until their
+process restarts. Use a fresh session when verifying the new behavior.
+
+On 2026-09-21, Kimi 0.42.0 with the already installed ACPX 0.13.2 passed a nested-cwd
+file-tool test that required distinct parent and child instruction markers, with
+no ACP file errors. Test versions describe this observation, not a runtime branch.
+The newer client is not required for this correction.
+
 ## zCode runtime
 
 The official local CLI inspected on 2026-09-21 (0.16.9) exposes ZCode Protocol
@@ -419,6 +454,14 @@ Its implementation remains an npm dependency; the Skill owns discovery,
 installation, launch identity, and diagnostics. See the bridge's
 [provider/bootstrap troubleshooting](https://github.com/william0wang/zcode-acp/blob/main/docs/TROUBLESHOOTING.md).
 This observation is not a claim about every past or future official release.
+
+A 2026-09-21 check of npm latest ACPX 0.18.0, its
+[release](https://github.com/openclaw/acpx/releases/tag/v0.18.0), and
+[published agent registry](https://github.com/openclaw/acpx/blob/v0.18.0/src/agent-registry.ts)
+found no built-in zCode entry or dedicated zCode change. The maintained bridge
+continues through ACPX's supported custom-agent route. Do not replace it merely
+because a newer generic client release exists; require applicable compatibility
+evidence before changing runtime dependencies.
 
 ```bash
 python3 scripts/install_user.py install --hosts none --targets zcode --update-zcode-adapter

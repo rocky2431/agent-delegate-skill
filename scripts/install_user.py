@@ -18,7 +18,7 @@ import tomllib
 from typing import Any
 
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -375,6 +375,8 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
         "pi": home / ".local/bin/pi",
     }
     for name in names:
+        if name == "kimi" and (selected := shutil.which(name)):
+            candidates[name] = Path(selected)
         executable = (_resolve_executable(home, [], [os.environ.get("ZCODE_NODE") or os.environ.get("ZCODE_ACP_NODE") or "node"]) if name == "zcode"
                       else _resolve_executable(home, [candidates[name]], [name]))
         argv = [str(executable), "acp"]
@@ -402,7 +404,10 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
                          "provenance": provenance,
                          "launch_argv": [str(home / ".local/share/agent-delegation/skill/scripts/agent_delegate.py"),
                                          "_launch", "--to", name]}
-        if name in ("claude", "codex"):
+        if name == "kimi":
+            targets[name]["native_fs"] = True
+            targets[name]["provenance"] = "native kimi acp; agent-native filesystem preserves project instruction discovery"
+        elif name in ("claude", "codex"):
             targets[name].update(
                 cli_env={"CLAUDE_CODE_EXECUTABLE" if name == "claude" else "CODEX_PATH": str(executable)},
                 adapter_package="@agentclientprotocol/" + package,

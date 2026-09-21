@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.7.0。
+版本：0.7.1。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -103,6 +103,20 @@ codex plugin marketplace add /absolute/path/to/agent-delegate-skill
 
 不要同时启用 Codex portable copy 和同名 plugin，否则 Codex 可能发现两份
 Skill。 `task-state-with-files` 是另一项独立 Skill，需要单独安装。
+
+### Kimi Code
+
+```bash
+python3 scripts/install_user.py install --hosts none --targets kimi
+```
+
+直接使用官方 `kimi acp`。注册时优先采用 PATH 中的 Kimi，找不到时才检查
+标准用户安装目录；版本记录用于诊断，不锁定执行版本。
+托管目标通过 ACPX 的 `--no-fs` 使用 Kimi 原生文件实现，让子目录任务正常
+加载父级项目指令，并沿用 Kimi 的账号、模型配置和 `KIMI_CODE_HOME`。
+由于 ACP 文件限制无法约束原生文件访问，该目标明确拒绝 `approve-reads`、
+`deny-all` 和 `--no-terminal`，避免把未生效的限制当成保护。新进程采用新能力；
+已经运行的命名会话保留原进程。
 
 ### 已审查目标
 

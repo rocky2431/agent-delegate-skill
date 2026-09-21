@@ -72,6 +72,7 @@ def serve_fixture() -> None:
         method = request.get("method")
         result: dict = {}
         if method == "initialize":
+            (state / "client-capabilities.json").write_text(json.dumps(request["params"]["clientCapabilities"]))
             time.sleep(float(os.environ.get("DELEGATION_FIXTURE_STARTUP_DELAY", "0")))
             result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True},
                       "authMethods": [], "agentInfo": {"name": "transport-fixture", "version": "1"}}
@@ -91,6 +92,37 @@ def serve_fixture() -> None:
 @unittest.skipUnless(os.environ.get("AGENT_DELEGATION_TEST_ACPX"),
                      "Set AGENT_DELEGATION_TEST_ACPX to the installed ACPX executable")
 class NativeTransportTests(unittest.TestCase):
+    def test_native_filesystem_disables_only_acp_file_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="delegation-native-fs-") as temporary:
+            root = Path(temporary)
+            (root / "state").mkdir()
+            (root / "native-home").mkdir()
+            preload = root / "isolate-home.cjs"
+            preload.write_text("require('node:os').homedir=()=>process.env.DELEGATION_FIXTURE_HOME;"
+                               "require('node:module').syncBuiltinESMExports();\n")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"schema_version": 1,
+                "acpx_path": os.environ["AGENT_DELEGATION_TEST_ACPX"],
+                "receipt_root": str(root / "receipts"), "default_timeout_seconds": 10,
+                "max_timeout_seconds": 30, "max_delegation_depth": 4,
+                "targets": {"fixture": {"argv": [sys.executable, str(Path(__file__).resolve()), "--fixture"],
+                                        "native_fs": True}}}))
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGENT_DELEGATION_", "DELEGATION_FIXTURE_"))}
+            env.update(AGENT_DELEGATION_CONFIG=str(registry),
+                       DELEGATION_FIXTURE_HOME=str(root / "native-home"),
+                       DELEGATION_FIXTURE_STATE=str(root / "state"),
+                       NODE_OPTIONS="--require " + str(preload))
+            result = subprocess.run([sys.executable, str(SCRIPT), "run", "--to", "fixture",
+                "--cwd", str(root), "--task", "CASE:native-fs"], env=env, text=True,
+                capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(result.stdout)["status"], "success")
+            capabilities = json.loads((root / "state/client-capabilities.json").read_text())
+            self.assertFalse(capabilities["fs"]["readTextFile"])
+            self.assertFalse(capabilities["fs"]["writeTextFile"])
+            self.assertTrue(capabilities["terminal"])
+
     def test_clean_followup_does_not_inherit_permission_denial(self) -> None:
         with tempfile.TemporaryDirectory(prefix="delegation-permission-turn-") as temporary:
             root = Path(temporary)

@@ -166,10 +166,29 @@ class InstallerTests(unittest.TestCase):
             kimi.parent.mkdir(parents=True)
             kimi.write_text("#!/bin/sh\necho fixture-kimi\n")
             kimi.chmod(0o755)
-            targets = install_user._build_managed_targets(home, home / "runtime", ["kimi"])
+            with patch.dict(os.environ, {"PATH": ""}):
+                targets = install_user._build_managed_targets(home, home / "runtime", ["kimi"])
             self.assertEqual(set(targets), {"kimi"})
             self.assertEqual(targets["kimi"]["argv"], [str(kimi), "acp"])
             self.assertEqual(install_user._build_managed_targets(home, home / "runtime", []), {})
+
+    def test_kimi_respects_path_selection_and_keeps_stable_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            default = home / ".kimi-code/bin/kimi"
+            selected = home / "selected/bin/kimi"
+            actual = home / "version-independent-cli"
+            for path in (default, actual):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("#!/bin/sh\necho native-cli\n")
+                path.chmod(0o755)
+            selected.parent.mkdir(parents=True)
+            selected.symlink_to(actual)
+            with patch.dict(os.environ, {"PATH": str(selected.parent)}):
+                target = install_user._build_managed_targets(home, home / "runtime", ["kimi"])["kimi"]
+            self.assertEqual(target["argv"], [str(selected), "acp"])
+            self.assertEqual(target["version_argv"], [str(selected), "--version"])
+            self.assertTrue(target["native_fs"])
 
     def test_stable_cli_symlink_is_not_resolved_to_retired_version(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

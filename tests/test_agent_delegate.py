@@ -126,6 +126,22 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertNotIn("--no-terminal", payload["command"])
         self.assertFalse((self.root / "receipts").exists())
 
+    def test_native_filesystem_keeps_cwd_and_rejects_unenforceable_restrictions(self) -> None:
+        registry = json.loads(self.registry.read_text())
+        registry["targets"]["beta"]["native_fs"] = True
+        self.registry.write_text(json.dumps(registry))
+        args = ["run", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture", "--dry-run"]
+        result = self.run_cli(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("--no-fs", payload["command"])
+        self.assertEqual(payload["cwd"], str(self.cwd.resolve()))
+        for restriction in (["--permissions", "approve-reads"], ["--permissions", "deny-all"], ["--no-terminal"]):
+            result = self.run_cli(*args, *restriction)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn("cannot be enforced", result.stderr)
+        self.assertFalse((self.root / "receipts").exists())
+
     def test_launcher_binds_and_records_the_native_cli_without_fallback(self) -> None:
         native = self.bin / "native cli"
         native.write_text("#!/bin/sh\necho native-v2\n")

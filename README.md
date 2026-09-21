@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.7.0.
+Version: 0.7.1.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -83,6 +83,23 @@ in a new runtime generation, preserving other dependency versions and the previo
 runtime. The official CLI supplies `app-server`; this bridge supplies ACP.
 Keep the native zCode plugin as the Skill installation. Configure authentication
 and a model in zCode first; the wrapper never guesses a fallback model.
+
+### Kimi Code
+
+```bash
+python3 scripts/install_user.py install --hosts none --targets kimi
+```
+
+The native `kimi acp` entry supplies ACP directly. Registration respects the `kimi`
+on PATH, falling back to the standard user install directory only when absent.
+The selected stable entry is recorded; its observed version never pins execution.
+The managed target uses ACPX `--no-fs` so Kimi loads project instructions and file
+tools through its own filesystem, including parent instructions for a nested cwd.
+It preserves Kimi's account/model configuration and `KIMI_CODE_HOME`.
+ACP filesystem restrictions cannot constrain native file access: `approve-reads`,
+`deny-all`, and `--no-terminal` are rejected for this target. Use its normal
+capabilities under the mission's existing authority. New processes load the changed
+capabilities; an already running named session keeps its old process.
 
 ### Pi
 
