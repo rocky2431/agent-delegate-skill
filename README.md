@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.7.1.
+Version: 0.8.0.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -346,6 +346,11 @@ Each submitted or synchronous task writes a private receipt under
 `status`, `wait`, and task-ID cancellation use the original receipt. If the
 submit response is lost, the startup message on stderr and `request.json` retain
 the task ID.
+
+`events.ndjson` keeps token-level updates and can reach hundreds of megabytes for a
+long task. `compact --apply` gzips it for receipts that have a final result and are
+at least seven days old (`--older-than-days` changes this); the compressed copy is
+verified byte for byte and nothing is deleted. Without `--apply` it only reports.
 
 If wrapper ownership disappears before a final result, the task becomes
 `incomplete` with `execution_state: unknown`. This ends wrapper observation but

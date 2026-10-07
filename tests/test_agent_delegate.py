@@ -881,6 +881,64 @@ class AgentDelegateCliTests(unittest.TestCase):
         self.assertEqual(notification.returncode, 1, notification.stderr)
         self.assertEqual(json.loads(notification.stdout)["status"], "unknown")
 
+    def test_compact_gzips_only_finished_old_receipts_without_losing_bytes(self) -> None:
+        import fcntl
+        import gzip
+
+        old = time.time() - 10 * 86400
+
+        def receipt(name: str, *, finished: bool, finished_at: float) -> Path:
+            task_id = name * 32
+            path = self.root / "receipts" / ("20260101T000000Z-" + task_id)
+            path.mkdir(parents=True)
+            (path / "request.json").write_text(json.dumps({"delegation_id": task_id}))
+            (path / "worker.lock").touch()
+            (path / "events.ndjson").write_bytes(("{\"chunk\": \"" + name + "\"}\n").encode() * 500)
+            if finished:
+                (path / "result.json").write_text(json.dumps({"delegation_id": task_id, "status": "success",
+                    "terminal": True, "receipt_dir": str(path), "assistant_text": "done " + name}))
+                os.utime(path / "result.json", (finished_at, finished_at))
+            return path
+
+        finished_old = receipt("a", finished=True, finished_at=old)
+        finished_recent = receipt("b", finished=True, finished_at=time.time())
+        unfinished = receipt("c", finished=False, finished_at=old)
+        busy = receipt("d", finished=True, finished_at=old)
+        original = (finished_old / "events.ndjson").read_bytes()
+        untouched = {path: (path / "events.ndjson").read_bytes() for path in (finished_recent, unfinished, busy)}
+
+        with (busy / "worker.lock").open("rb") as owner:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX)
+            report = self.run_cli("compact", "--older-than-days", "7")
+            self.assertEqual(report.returncode, 0, report.stderr)
+            dry = json.loads(report.stdout)
+            self.assertEqual((dry["status"], dry["compacted"]), ("dry_run", 1))
+            self.assertEqual(dry["bytes_before"], len(original))
+            self.assertEqual(dry["skipped"], {"not_finished": 1, "too_recent": 1, "worker_active": 1,
+                                              "no_raw_events": 0})
+            self.assertFalse((finished_old / "events.ndjson.gz").exists())
+
+            applied = self.run_cli("compact", "--older-than-days", "7", "--apply")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            summary = json.loads(applied.stdout)
+        self.assertEqual((summary["status"], summary["compacted"]), ("applied", 1))
+        self.assertFalse((finished_old / "events.ndjson").exists())
+        self.assertEqual(gzip.decompress((finished_old / "events.ndjson.gz").read_bytes()), original)
+        self.assertLess(summary["bytes_after"], summary["bytes_before"])
+        for path, body in untouched.items():
+            self.assertEqual((path / "events.ndjson").read_bytes(), body, path.name)
+            self.assertFalse((path / "events.ndjson.gz").exists(), path.name)
+
+        status = json.loads(self.run_cli("status", "--id", "a" * 32).stdout)
+        self.assertEqual((status["terminal"], status["assistant_text"]), (True, "done a"))
+        # The busy receipt became eligible once its worker released the lock; a compacted
+        # receipt is never processed again.
+        released = json.loads(self.run_cli("compact", "--older-than-days", "7", "--apply").stdout)
+        self.assertEqual((released["compacted"], released["skipped"]["no_raw_events"]), (1, 1))
+        self.assertEqual(gzip.decompress((busy / "events.ndjson.gz").read_bytes()), untouched[busy])
+        again = json.loads(self.run_cli("compact", "--older-than-days", "7", "--apply").stdout)
+        self.assertEqual((again["compacted"], again["skipped"]["no_raw_events"]), (0, 2))
+
     def test_completion_event_keeps_worker_content_in_the_original_receipt(self) -> None:
         task = json.loads(self.run_cli("submit", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture").stdout)
         result = self.run_cli("wait", "--id", task["delegation_id"], "--event")

@@ -7,6 +7,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import fcntl
+import gzip
 import hashlib
 import json
 import os
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import zcode_runtime
 
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -1391,6 +1392,84 @@ def _register(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_active(receipt_dir: Path) -> bool:
+    lock = receipt_dir / "worker.lock"
+    if not lock.exists():
+        return False
+    with lock.open("rb") as owner:
+        try:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def _gzip_verified(events: Path) -> int:
+    """Replace events.ndjson with a gzip copy only after the copy reads back identically."""
+    packed_path = events.with_name(events.name + ".gz")
+    staging = events.with_name(events.name + ".gz.tmp")
+    staging.unlink(missing_ok=True)  # An interrupted earlier attempt left the original intact.
+    expected = hashlib.sha256()
+    with events.open("rb") as source, staging.open("xb") as raw:
+        os.chmod(staging, 0o600)
+        with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) as packed:
+            for block in iter(lambda: source.read(1 << 20), b""):
+                expected.update(block)
+                packed.write(block)
+        raw.flush()
+        os.fsync(raw.fileno())
+    observed = hashlib.sha256()
+    with gzip.open(staging, "rb") as unpacked:
+        for block in iter(lambda: unpacked.read(1 << 20), b""):
+            observed.update(block)
+    if observed.digest() != expected.digest():
+        staging.unlink()
+        raise DelegationError(f"Compressed copy of {events} did not verify; the original is kept.")
+    os.replace(staging, packed_path)
+    events.unlink()
+    return packed_path.stat().st_size
+
+
+def _compact_receipts(args: argparse.Namespace) -> int:
+    """Gzip the raw ACP event stream of finished receipts; every byte stays readable.
+
+    After result.json exists, status, wait and replay read only result.json, so the raw
+    stream is evidence for people, not input. Unfinished or active receipts keep theirs
+    for inspection, and nothing is deleted.
+    """
+    if args.older_than_days < 0:
+        raise DelegationError("--older-than-days must not be negative.")
+    _, registry = _load_registry()
+    root_raw = registry.get("receipt_root")
+    if not isinstance(root_raw, str) or not Path(root_raw).is_absolute():
+        raise DelegationError("Registry receipt_root must be an absolute path.")
+    root = Path(root_raw)
+    cutoff = time.time() - args.older_than_days * 86400
+    summary: dict[str, Any] = {
+        "status": "applied" if args.apply else "dry_run", "receipt_root": str(root),
+        "older_than_days": args.older_than_days, "compacted": 0, "bytes_before": 0, "bytes_after": 0,
+        "skipped": {"not_finished": 0, "too_recent": 0, "worker_active": 0, "no_raw_events": 0},
+    }
+    receipts = sorted(root.iterdir()) if root.is_dir() else []
+    for receipt_dir in receipts:
+        if not (re.fullmatch(r".+-[0-9a-f]{32}", receipt_dir.name) and (receipt_dir / "request.json").is_file()):
+            continue
+        events, result = receipt_dir / "events.ndjson", receipt_dir / "result.json"
+        reason = ("no_raw_events" if not events.is_file() else
+                  "not_finished" if not result.is_file() else
+                  "too_recent" if result.stat().st_mtime > cutoff else
+                  "worker_active" if _worker_active(receipt_dir) else None)
+        if reason:
+            summary["skipped"][reason] += 1
+            continue
+        summary["compacted"] += 1
+        summary["bytes_before"] += events.stat().st_size
+        if args.apply:
+            summary["bytes_after"] += _gzip_verified(events)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-delegate",
@@ -1482,6 +1561,14 @@ def _build_parser() -> argparse.ArgumentParser:
         notifier.add_argument("--retry", action="store_true",
                               help="Retry failed or uncertain delivery only after inspecting the original host queue.")
         notifier.set_defaults(handler=_notify_task)
+
+    compact_parser = subparsers.add_parser(
+        "compact", help="Gzip the raw event streams of finished receipts; nothing is deleted.")
+    compact_parser.add_argument("--older-than-days", type=float, default=7.0,
+                                help="Only receipts whose result was written at least this long ago (default 7).")
+    compact_parser.add_argument("--apply", action="store_true",
+                                help="Compress the selected streams; without it, only report what would change.")
+    compact_parser.set_defaults(handler=_compact_receipts)
 
     register_parser = subparsers.add_parser("register", help="Register an additional reviewed ACP target.")
     register_parser.add_argument("--name", required=True)

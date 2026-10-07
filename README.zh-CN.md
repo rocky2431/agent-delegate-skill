@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.7.1。
+版本：0.8.0。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -295,6 +295,11 @@ sandbox。能够触达敏感系统的任务，仍需使用对应宿主或工具�
 
 `status`、`wait` 和按任务 ID 取消都会复用原收据。如果 submit 响应丢失，
 stderr 中的启动消息和 `request.json` 仍保留任务 ID。
+
+`events.ndjson` 会记录逐 token 的更新，长任务的单份收据可能达到几百 MB。
+`compact --apply` 会对已有最终结果、且结束满 7 天的收据（可用 `--older-than-days` 调整）
+做 gzip 压缩；压缩件逐字节核对一致后才替换原文件，不删除任何内容。不加 `--apply`
+时只报告会处理哪些。
 
 如果 wrapper 在生成最终结果前失去 ownership，任务状态会变成 `incomplete`，
 `execution_state` 为 `unknown`。这只表示 wrapper 无法继续观察，不能证明

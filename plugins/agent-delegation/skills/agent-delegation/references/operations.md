@@ -394,6 +394,26 @@ when its process exits zero; inspect the events and diagnostics before continuin
 error does not turn `end_turn` into failure. Raw events remain the evidence when
 an adapter cannot supply enough information to classify an event.
 
+### Compact finished receipts
+
+`events.ndjson` keeps every streamed update, including token-level message chunks,
+so long missions can leave hundreds of megabytes per receipt and nothing removes them.
+Once `result.json` exists, `status`, `wait`, `ack` and replay read only that file; the raw
+stream is evidence for a person, not input to the wrapper. `compact` gzips it losslessly:
+
+```bash
+python3 "<skill-dir>/scripts/agent_delegate.py" compact                 # report only
+python3 "<skill-dir>/scripts/agent_delegate.py" compact --apply         # compress
+python3 "<skill-dir>/scripts/agent_delegate.py" compact --older-than-days 30 --apply
+```
+
+It selects receipts whose `result.json` was written at least `--older-than-days` ago
+(default 7) and whose worker no longer holds `worker.lock`. Receipts without a final
+result keep their raw stream for inspection. Each stream becomes `events.ndjson.gz` only
+after the compressed copy reads back byte-for-byte; the original is then removed, and no
+other file is touched or deleted. Read a compacted stream with `gzip -dc events.ndjson.gz`.
+The report counts compacted and skipped receipts and the bytes before and after.
+
 ## Diagnose and recover
 
 ```bash
