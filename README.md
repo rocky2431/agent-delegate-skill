@@ -3,7 +3,7 @@
 [English](README.md) · [简体中文](README.zh-CN.md)
 
 Agent Delegation lets one local coding agent hand a mission to another. It works
-with Hermes, Claude Code, Codex, Kimi Code, zCode, OpenCode, Pi, and other registered
+with Hermes, Claude Code, Codex, Kimi Code, zCode, OpenCode, Pi, Grok Build, and other registered
 ACP agents.
 
 The worker receives the goal, relevant context, existing authority, and a useful
@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.8.0.
+Version: 0.9.0.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -100,6 +100,42 @@ ACP filesystem restrictions cannot constrain native file access: `approve-reads`
 `deny-all`, and `--no-terminal` are rejected for this target. Use its normal
 capabilities under the mission's existing authority. New processes load the changed
 capabilities; an already running named session keeps its old process.
+
+### Grok Build
+
+Install and authenticate the [official Grok CLI](https://github.com/xai-org/grok-build),
+then register it without updating other targets or runtime dependencies:
+
+```bash
+python3 scripts/install_user.py install --hosts none --targets grok
+```
+
+Delegate with `--to grok`. The installer selects `grok` on PATH, falling back to
+`~/.local/bin/grok`, and retains the stable executable path across CLI updates.
+It uses native ACP (`grok agent --no-leader stdio`), so no additional adapter is
+needed. Grok keeps its own login, model default and `GROK_HOME`; an explicit
+`--model` uses the existing ACP model-selection path. Dedicated processes avoid
+attaching delegated work to an unrelated shared Grok leader.
+
+Native tools and auto-approvals can bypass ACP permission requests, and disabling
+client Terminal can select a local terminal instead. The managed target therefore
+rejects `approve-reads`, `deny-all`, and `--no-terminal` rather than promising those
+restrictions. Native Grok rules and hooks still apply.
+
+To initiate delegation from Grok, install this plugin through Excellent Skill
+Marketplace, then use the loaded Skill entry with `--caller grok`:
+
+```bash
+grok plugin marketplace add rocky2431/Excellent-skill-Marketplace
+grok plugin marketplace update excellent-skill-marketplace
+grok plugin install agent-delegation --trust
+```
+
+Grok selects its native installed package before a Claude compatibility copy.
+Keep one active Skill package. Grok is a managed target; `--hosts` selects only
+the portable installation paths in the table above.
+See the [observed verification limits](plugins/agent-delegation/skills/agent-delegation/references/operations.md#grok-build-runtime)
+before treating a local registration as a successful task.
 
 ### Pi
 

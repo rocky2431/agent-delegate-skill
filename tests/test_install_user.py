@@ -200,6 +200,34 @@ class InstallerTests(unittest.TestCase):
             stable.symlink_to(executable)
             self.assertEqual(install_user._resolve_executable(home, [stable], []), stable)
 
+    def test_grok_native_target_preserves_cli_selection_and_rejects_false_restrictions(self) -> None:
+        import agent_delegate as delegate
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            default, selected = home / ".local/bin/grok", home / "custom bin/grok"
+            default.parent.mkdir(parents=True)
+            default.write_text("#!/bin/sh\necho grok-fixture\n")
+            default.chmod(0o755)
+            selected.parent.mkdir()
+            selected.symlink_to(default)
+            self.assertEqual(install_user._parse_hosts("grok,grok", install_user.TARGETS), ["grok"])
+            with self.assertRaises(install_user.InstallError):
+                install_user._parse_hosts("grok")  # Grok uses its native plugin manager.
+            for path, expected in (("", default), (str(selected.parent), selected)):
+                with self.subTest(path=path), patch.dict(os.environ, {"PATH": path}):
+                    target = install_user._build_managed_targets(home, home / "runtime", ["grok"])["grok"]
+                self.assertEqual(target["argv"], [str(expected), "agent", "--no-leader", "stdio"])
+                self.assertEqual(target["version_argv"], [str(expected), "--version"])
+                self.assertEqual(target["observed_version"], "grok-fixture")
+                delegate._validate_target_record("grok", target)
+                for flags in (("--permissions", "deny-all"), ("--permissions", "approve-reads"), ("--no-terminal",)):
+                    args = delegate._build_parser().parse_args(
+                        ["run", "--to", "grok", "--cwd", temporary, "--task", "test", *flags])
+                    with patch.object(delegate, "_load_registry", return_value=(home, {"targets": {"grok": target}})):
+                        with self.assertRaisesRegex(delegate.DelegationError, "cannot be enforced"):
+                            delegate._prepare_run(args)
+
     def test_zcode_uses_managed_adapter_without_baked_cli_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)

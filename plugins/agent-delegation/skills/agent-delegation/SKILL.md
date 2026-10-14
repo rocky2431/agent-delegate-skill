@@ -1,6 +1,6 @@
 ---
 name: agent-delegation
-description: Delegate missions between Hermes, Claude Code, Codex, Kimi, zCode, OpenCode, Pi, or another installed ACP agent, with native session continuation and inspectable results.
+description: Delegate missions between Hermes, Claude Code, Codex, Kimi, zCode, OpenCode, Pi, Grok Build, or another installed ACP agent, with native session continuation and inspectable results.
 ---
 
 # Agent Delegation
@@ -164,3 +164,5 @@ Managed targets use the installed local CLI; Codex and Claude adapters bind it e
 The managed zCode target uses `zcode-acp-server` over the local CLI app-server. It resolves the CLI, account, and configured model at startup; it never guesses a fallback model. Use `install --update-zcode-adapter --targets zcode` for a targeted bridge update. See [zCode runtime](references/operations.md#zcode-runtime) for discovery overrides and readiness diagnostics.
 
 The managed Kimi target uses native `kimi acp` with ACPX `--no-fs` so its own filesystem loads parent project instructions. Like managed Pi, it rejects `approve-reads`, `deny-all`, and `--no-terminal` because these cannot constrain native tools. Model/account configuration remains with Kimi. See [Kimi runtime](references/operations.md#kimi-runtime).
+
+The managed `grok` target uses the official Grok Build CLI through `grok agent --no-leader stdio`; no bridge package is needed. Keep its native authentication, model defaults, and `GROK_HOME`. Like Pi, native tool paths prevent complete ACP restrictions, so `approve-reads`, `deny-all`, and `--no-terminal` are rejected. Use `--caller grok` when Grok initiates a mission, with the normal other-host completion rules above. See [Grok Build runtime](references/operations.md#grok-build-runtime).

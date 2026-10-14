@@ -18,7 +18,7 @@ import tomllib
 from typing import Any
 
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +34,7 @@ import zcode_runtime
 
 DELEGATE_ENTRY_SOURCE = REPO_ROOT / "runtime" / "acpx_delegate_entry.cjs"
 HOSTS = ("hermes", "claude", "codex", "kimi", "zcode", "opencode", "pi")
+TARGETS = (*HOSTS, "grok")
 PORTABLE_HOSTS = ("hermes", "opencode", "pi")
 RUNTIME_PACKAGES = ("acpx", "@agentclientprotocol/claude-agent-acp", "@agentclientprotocol/codex-acp")
 LEGACY_DEFAULT_CHAR_LIMITS = {
@@ -60,7 +61,7 @@ def _skill_destination(home: Path, host: str) -> Path:
     return roots[host] / "agent-delegation"
 
 
-def _parse_hosts(raw: str) -> list[str]:
+def _parse_hosts(raw: str, choices: tuple[str, ...] = HOSTS) -> list[str]:
     if raw.strip().lower() == "none":
         return []
     hosts: list[str] = []
@@ -68,8 +69,8 @@ def _parse_hosts(raw: str) -> list[str]:
         host = item.strip().lower()
         if not host or host in hosts:
             continue
-        if host not in HOSTS:
-            raise InstallError(f"Unsupported host {host!r}; choose from {', '.join(HOSTS)}, or none.")
+        if host not in choices:
+            raise InstallError(f"Unsupported host or target {host!r}; choose from {', '.join(choices)}, or none.")
         hosts.append(host)
     if not hosts:
         raise InstallError("At least one host is required, or pass --hosts none.")
@@ -373,9 +374,10 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
         "codex": home / ".local/bin/codex", "kimi": home / ".kimi-code/bin/kimi",
         "opencode": home / ".opencode/bin/opencode",
         "pi": home / ".local/bin/pi",
+        "grok": home / ".local/bin/grok",
     }
     for name in names:
-        if name == "kimi" and (selected := shutil.which(name)):
+        if name in ("kimi", "grok") and (selected := shutil.which(name)):
             candidates[name] = Path(selected)
         executable = (_resolve_executable(home, [], [os.environ.get("ZCODE_NODE") or os.environ.get("ZCODE_ACP_NODE") or "node"]) if name == "zcode"
                       else _resolve_executable(home, [candidates[name]], [name]))
@@ -399,6 +401,9 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
             if not adapter.is_file():
                 raise InstallError("Managed zCode ACP adapter is missing; use install --update-zcode-adapter --targets zcode")
             argv = [str(executable), str(adapter)]
+        elif name == "grok":
+            argv = [str(executable), "agent", "--no-leader", "stdio"]
+            provenance = "official Grok Build CLI with native ACP; dedicated process"
         targets[name] = {"argv": argv, "version_argv": [str(executable), "--version"],
                          "observed_version": _version_line([str(executable), "--version"]),
                          "provenance": provenance,
@@ -407,6 +412,9 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
         if name == "kimi":
             targets[name]["native_fs"] = True
             targets[name]["provenance"] = "native kimi acp; agent-native filesystem preserves project instruction discovery"
+        elif name == "grok":
+            # Native tools can bypass ACP permissions or fall back when client IO is absent.
+            targets[name]["native_local_tools"] = True
         elif name in ("claude", "codex"):
             targets[name].update(
                 cli_env={"CLAUDE_CODE_EXECUTABLE" if name == "claude" else "CODEX_PATH": str(executable)},
@@ -513,7 +521,7 @@ def _install_symlink(
 def _install(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if args.home else Path.home()
     hosts = _parse_hosts(args.hosts)
-    target_names = _parse_hosts(args.targets) if args.targets is not None else hosts
+    target_names = _parse_hosts(args.targets, TARGETS) if args.targets is not None else hosts
     if not SKILL_SOURCE.is_dir():
         raise InstallError(f"Missing Skill source {SKILL_SOURCE}.")
     for host in hosts:
@@ -605,7 +613,7 @@ def _uninstall(args: argparse.Namespace) -> int:
     registered_targets = registry.get("targets") or {}
     if not isinstance(registered_targets, dict):
         raise InstallError("Existing delegation targets must be a JSON object.")
-    custom_targets = sorted(set(registered_targets) - set(HOSTS))
+    custom_targets = sorted(set(registered_targets) - set(TARGETS))
     if args.remove_runtime and custom_targets:
         raise InstallError(
             "Refusing to remove the shared runtime while custom targets remain: "
@@ -627,7 +635,7 @@ def _uninstall(args: argparse.Namespace) -> int:
         agents = acpx_config.get("agents") or {}
         if not isinstance(agents, dict):
             raise InstallError("Existing ACPX agents must be a JSON object.")
-        for name in HOSTS:
+        for name in TARGETS:
             record = registered_targets.get(name)
             expected = {"argv": record.get("launch_argv", record.get("argv"))} if isinstance(record, dict) else None
             if expected is not None and agents.get(name) == expected:

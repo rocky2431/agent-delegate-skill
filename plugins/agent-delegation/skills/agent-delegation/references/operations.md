@@ -548,6 +548,44 @@ snapshot, not an installer version policy. To roll back, restore the backed-up
 registry and ACPX configuration and repoint the `acpx` command to that registry's
 `acpx_path`. Retain any runtime directories still needed by active tasks or sessions.
 
+## Grok Build runtime
+
+Register the installed official CLI with `install --hosts none --targets grok`.
+The managed target runs `grok agent --no-leader stdio`, reusing ACPX sessions,
+model selection, cancellation and receipts. No npm adapter or runtime upgrade
+is required. Login and model defaults stay in Grok; `GROK_HOME` is inherited.
+Grok can also load this package through its native plugin manager and initiate
+missions with `--caller grok`. This package does not install a Grok idle-wakeup
+extension; use the host's actual completion facility or one attached wait.
+
+Grok has native tool paths and built-in auto-approvals. `--no-terminal` can fall
+back to local execution rather than remove shell access. The managed target
+rejects `approve-reads`, `deny-all`, and `--no-terminal` before dispatch; native
+permission rules and hooks remain effective. Do not register it manually without
+this restriction metadata and assume ACP permissions constrain all native tools.
+
+Primary references, checked 2026-10-14: [ACP agent mode](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/15-agent-mode.md),
+[permissions](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/22-permissions-and-safety.md).
+
+Observed on 2026-10-14 with macOS, Grok 1.0.52 and ACPX 0.13.2: normal-HOME
+managed launch, file read/write, named-session recall, explicit `--model grok-4.7`,
+`submit`/`wait` and one-time collection passed with `end_turn` receipts. The two
+turns took 29.875s and 8.736s with no TLS retries. Grok retained the real account,
+model configuration and all three configured MCP servers.
+
+The local repair installed Hindsight's official `grok-build` hooks and disabled
+only inherited global Claude hook entries tied to missing Clawd scripts, Claude
+transcript parsing, or Claude token accounting. Native, project and plugin hooks
+remained enabled; permission requests still occurred. Use the host's supported
+hook controls and inspect the actual hook list before changing another setup.
+
+Earlier runs had TLS retries, an incomplete receipt and a timeout. The successful
+replays do not establish the cause of the earlier remote TLS disconnect or promise
+that it cannot recur. Never disable certificate validation or promote incomplete
+receipts to success. Grok-origin idle wakeup remains unverified.
+
+## Custom ACP targets
+
 Register an already installed ACP executable when the owner requests a new target:
 
 ```bash
