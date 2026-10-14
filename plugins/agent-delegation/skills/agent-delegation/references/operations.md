@@ -557,8 +557,10 @@ filesystem capability so Grok uses its own file tools, preserving reads of loade
 Skills outside the task directory. No npm adapter or runtime upgrade
 is required. Login and model defaults stay in Grok; `GROK_HOME` is inherited.
 Grok can also load this package through its native plugin manager and initiate
-missions with `--caller grok`. This package does not install a Grok idle-wakeup
-extension; use the host's actual completion facility or one attached wait.
+missions with `--caller grok`. Run one `wait --id <id> --event` through native
+`run_terminal_command` with `block_until_ms: 0`, then end the turn. Grok delivers
+the background command's completion to the idle session; collect the full result
+once after that event. Keep the session open. No extra wakeup extension is needed.
 
 Grok has native tool paths and built-in auto-approvals. `--no-terminal` can fall
 back to local execution rather than remove shell access. The managed target
@@ -581,10 +583,19 @@ transcript parsing, or Claude token accounting. Native, project and plugin hooks
 remained enabled; permission requests still occurred. Use the host's supported
 hook controls and inspect the actual hook list before changing another setup.
 
-Earlier runs had TLS retries, an incomplete receipt and a timeout. The successful
-replays do not establish the cause of the earlier remote TLS disconnect or promise
-that it cannot recur. Never disable certificate validation or promote incomplete
-receipts to success. Grok-origin idle wakeup remains unverified.
+Earlier runs had TLS retries, an incomplete receipt and a timeout. macOS power
+logs show that both failing Grok executions crossed system sleep intervals
+(950s and 197s). The runtime now holds `caffeinate -i` only while a delegation is
+executing or queued, and releases it on completion or interruption. This prevents
+idle sleep from suspending the active transport; it does not override an explicit
+system sleep or prove that every remote TLS failure has the same cause. Twenty
+subsequent TLS handshakes and the recorded native flows succeeded without retries.
+Never disable certificate validation or promote incomplete receipts to success.
+
+A real Grok-origin background observer also completed a Claude delegation: the
+parent turn ended at 27.218s, then a native completion event woke it to validate
+the receipt and write the expected marker at 79.431s, without a second user prompt
+or model polling. This establishes the tested live session's idle delivery.
 
 A subsequent real run exposed the client filesystem rejecting a user Skill outside
 the cwd. After selecting native filesystem tools, a fresh normal-HOME session read

@@ -47,6 +47,11 @@ This Skill handles external ACP missions only.
   The background output contains only an event and receipt path. Backgrounding
   `submit` alone reports submission, not mission completion. Do not poll TaskOutput
   or repeatedly read its output file while waiting.
+- **Grok Build:** submit once with `--caller grok`, then run `wait --id <id> --event`
+  through native `run_terminal_command` with `block_until_ms: 0`. End the turn;
+  Grok's command-completion event wakes the same session. Read that event and
+  collect once with the full `wait --id <id>`. Keep the native session open.
+  Do not use Bash's `run_in_background` argument or detach the observer with `&`.
 - **Other hosts:** use a native background completion notification when available,
   or one attached wait when the host can keep it alive. Without a wake facility,
   retain the ID and report that limitation; do not emulate one with timed model turns.

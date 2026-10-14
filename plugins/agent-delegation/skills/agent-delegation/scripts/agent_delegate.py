@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import zcode_runtime
 
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -689,6 +689,29 @@ def _worker(args: argparse.Namespace) -> int:
         return _execute_run(receipt_dir, launch)
 
 
+@contextmanager
+def _prevent_idle_sleep() -> Iterator[None]:
+    if sys.platform != "darwin":
+        yield
+        return
+    try:
+        guard = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"Idle sleep protection unavailable: {exc}", file=sys.stderr)
+        yield
+        return
+    try:
+        yield
+    finally:
+        guard.terminate()
+        try:
+            guard.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            guard.kill()
+            guard.wait()
+
+
 def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
     request, commands = launch["request"], launch["commands"]
     timeout, session = request["timeout_seconds"], request["session_name"]
@@ -729,7 +752,7 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
         raise KeyboardInterrupt
     previous_handler = signal.signal(signal.SIGTERM, handle_termination)
     try:
-        with (receipt_dir / "events.ndjson").open("xb", buffering=0) as stdout, (receipt_dir / "stderr.log").open("xb", buffering=0) as stderr:
+        with _prevent_idle_sleep(), (receipt_dir / "events.ndjson").open("xb", buffering=0) as stdout, (receipt_dir / "stderr.log").open("xb", buffering=0) as stderr:
             os.chmod(stdout.name, 0o600)
             os.chmod(stderr.name, 0o600)
             def cancel_named_turn() -> None:

@@ -567,6 +567,23 @@ class AgentDelegateCliTests(unittest.TestCase):
             self.assertEqual((code, reason), (124, "timeout"))
             self.assertEqual(output.read(), b"PARTIAL\n")
 
+    def test_idle_sleep_assertion_is_scoped_to_active_execution(self) -> None:
+        spec = importlib.util.spec_from_file_location("wrapper", SCRIPT)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        with patch.object(wrapper.sys, "platform", "darwin"), patch.object(wrapper.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                with wrapper._prevent_idle_sleep():
+                    self.assertEqual(launch.call_args.args[0],
+                                     ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())])
+                    launch.return_value.terminate.assert_not_called()
+                    raise RuntimeError("interrupted")
+            launch.return_value.terminate.assert_called_once()
+            launch.return_value.wait.assert_called_once_with(timeout=5)
+        with patch.object(wrapper.sys, "platform", "linux"), patch.object(wrapper.subprocess, "Popen") as launch:
+            with wrapper._prevent_idle_sleep():
+                launch.assert_not_called()
+
     def test_doctor_target_scope_and_stale_probe_warning(self) -> None:
         registry = json.loads(self.registry.read_text())
         registry["targets"]["beta"]["version_argv"] = ["/missing-old-version", "--version"]
