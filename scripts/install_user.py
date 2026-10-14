@@ -18,7 +18,7 @@ import tomllib
 from typing import Any
 
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -415,6 +415,7 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
         elif name == "grok":
             # Native tools can bypass ACP permissions or fall back when client IO is absent.
             targets[name]["native_local_tools"] = True
+            targets[name]["native_fs"] = True
         elif name in ("claude", "codex"):
             targets[name].update(
                 cli_env={"CLAUDE_CODE_EXECUTABLE" if name == "claude" else "CODEX_PATH": str(executable)},

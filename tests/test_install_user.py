@@ -220,6 +220,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(target["argv"], [str(expected), "agent", "--no-leader", "stdio"])
                 self.assertEqual(target["version_argv"], [str(expected), "--version"])
                 self.assertEqual(target["observed_version"], "grok-fixture")
+                self.assertTrue(target.get("native_fs"))
                 delegate._validate_target_record("grok", target)
                 for flags in (("--permissions", "deny-all"), ("--permissions", "approve-reads"), ("--no-terminal",)):
                     args = delegate._build_parser().parse_args(

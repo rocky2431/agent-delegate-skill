@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.9.0.
+Version: 0.9.1.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -115,7 +115,9 @@ Delegate with `--to grok`. The installer selects `grok` on PATH, falling back to
 It uses native ACP (`grok agent --no-leader stdio`), so no additional adapter is
 needed. Grok keeps its own login, model default and `GROK_HOME`; an explicit
 `--model` uses the existing ACP model-selection path. Dedicated processes avoid
-attaching delegated work to an unrelated shared Grok leader.
+attaching delegated work to an unrelated shared Grok leader. The target uses
+Grok-native filesystem tools (`native_fs: true`) so user Skills and project
+instructions outside the delegated directory remain readable.
 
 Native tools and auto-approvals can bypass ACP permission requests, and disabling
 client Terminal can select a local terminal instead. The managed target therefore

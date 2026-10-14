@@ -552,7 +552,9 @@ registry and ACPX configuration and repoint the `acpx` command to that registry'
 
 Register the installed official CLI with `install --hosts none --targets grok`.
 The managed target runs `grok agent --no-leader stdio`, reusing ACPX sessions,
-model selection, cancellation and receipts. No npm adapter or runtime upgrade
+model selection, cancellation and receipts. `native_fs: true` removes the client
+filesystem capability so Grok uses its own file tools, preserving reads of loaded
+Skills outside the task directory. No npm adapter or runtime upgrade
 is required. Login and model defaults stay in Grok; `GROK_HOME` is inherited.
 Grok can also load this package through its native plugin manager and initiate
 missions with `--caller grok`. This package does not install a Grok idle-wakeup
@@ -583,6 +585,11 @@ Earlier runs had TLS retries, an incomplete receipt and a timeout. The successfu
 replays do not establish the cause of the earlier remote TLS disconnect or promise
 that it cannot recur. Never disable certificate validation or promote incomplete
 receipts to success. Grok-origin idle wakeup remains unverified.
+
+A subsequent real run exposed the client filesystem rejecting a user Skill outside
+the cwd. After selecting native filesystem tools, a fresh normal-HOME session read
+the installed Hindsight Skill and copied a file successfully in 33.354s, with no
+RPC or tool errors.
 
 ## Custom ACP targets
 
