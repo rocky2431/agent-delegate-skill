@@ -149,8 +149,12 @@ Keep the delegation ID, terminal receipt and actual output references in the exi
 task record, if present; do not create a second progress ledger merely for dispatch.
 One designated writer integrates the worker's evidence into that record. Record the
 consumer's business verdict and its check separately from transport status. Use
-existing project document paths, or `documents/<work-id>/` for new business artifacts
-without a convention; keep private receipts in their existing runtime location.
+existing project document paths or the project's documented convention; otherwise put
+new business artifacts in `delegations/<YYYY-MM-DD>-<slug>/` at the project root. On
+first use, create `delegations/` with a `README.md` whose first line is
+`<!-- managed-by: agent-delegation -->`; a `delegations/` folder without that line
+belongs to the project, so choose another location with the user. Keep private
+receipts in their existing runtime location.
 
 `success` means the ACP turn ended normally, not that the user's outcome is proven. Integrate the result and verify decision-critical claims proportionally. Tool errors such as a missing optional file do not automatically invalidate a completed turn. Inspect their details instead of requiring an empty error list or repeating all of the worker's work.
 
