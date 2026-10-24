@@ -19,6 +19,11 @@ import uuid
 SCRIPT = Path(__file__).resolve().parents[1] / "plugins/agent-delegation/skills/agent-delegation/scripts/agent_delegate.py"
 
 
+def acpx_version() -> str:
+    return subprocess.run([os.environ["AGENT_DELEGATION_TEST_ACPX"], "--version"], text=True,
+                          capture_output=True, check=True, timeout=30).stdout.strip()
+
+
 def serve_fixture() -> None:
     assert "AGENT_DELEGATION_ENTRY" not in os.environ
     state = Path(os.environ["DELEGATION_FIXTURE_STATE"])
@@ -26,6 +31,12 @@ def serve_fixture() -> None:
     cancelled = threading.Event()
     permission_reply = threading.Event()
     native_version = subprocess.check_output([os.environ["CODEX_PATH"], "--version"], text=True).strip() if os.environ.get("DELEGATION_FIXTURE_NATIVE") else "unused"
+    efforts: dict[str, str] = {}
+
+    def config_options(session: str) -> list[dict]:
+        return [{"type": "select", "id": "effort", "category": "thought_level", "name": "Effort",
+                 "currentValue": efforts.get(session, "medium"),
+                 "options": [{"value": value, "name": value} for value in ("low", "medium", "high")]}]
 
     def send(value: dict) -> None:
         with output_lock:
@@ -41,6 +52,8 @@ def serve_fixture() -> None:
         marker = text.rsplit("CASE:", 1)[-1].strip()
         cancelled.clear()
         response = native_version if marker == "identity" else f"{marker}:turn={turns}"
+        if marker == "effort":
+            response = f"effort={efforts.get(session, 'medium')}:turn={turns}"
         if marker == "permission":
             permission_reply.clear()
             send({"id": "fixture-permission", "method": "session/request_permission", "params": {
@@ -79,7 +92,17 @@ def serve_fixture() -> None:
         elif method == "session/new":
             session = uuid.uuid4().hex
             (state / (session + ".json")).write_text("0")
-            result = {"sessionId": session}
+            result = {"sessionId": session, "configOptions": config_options(session)}
+        elif method == "session/load":
+            result = {"configOptions": config_options(request["params"]["sessionId"])}
+        elif method == "session/set_config_option":
+            params = request["params"]
+            if params["configId"] != "effort" or params["value"] not in ("low", "medium", "high"):
+                send({"id": request["id"], "error": {"code": -32602, "message": "Unknown config option"}})
+                continue
+            efforts[params["sessionId"]] = params["value"]
+            (state / (params["sessionId"] + ".config")).write_text(params["value"])
+            result = {"configOptions": config_options(params["sessionId"])}
         elif method == "session/prompt":
             threading.Thread(target=prompt, args=(request,), daemon=True).start()
             continue
@@ -123,6 +146,71 @@ class NativeTransportTests(unittest.TestCase):
             self.assertFalse(capabilities["fs"]["writeTextFile"])
             self.assertTrue(capabilities["terminal"])
 
+    def test_config_options_apply_before_the_prompt(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="delegation-config-option-") as temporary:
+            root = Path(temporary)
+            (root / "state").mkdir()
+            (root / "native-home").mkdir()
+            preload = root / "isolate-home.cjs"
+            preload.write_text("require('node:os').homedir=()=>process.env.DELEGATION_FIXTURE_HOME;"
+                               "require('node:module').syncBuiltinESMExports();\n")
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"schema_version": 1,
+                "acpx_path": os.environ["AGENT_DELEGATION_TEST_ACPX"],
+                "receipt_root": str(root / "receipts"), "default_timeout_seconds": 10,
+                "max_timeout_seconds": 30, "max_delegation_depth": 4,
+                "targets": {"fixture": {"argv": [sys.executable, str(Path(__file__).resolve()), "--fixture"]}}}))
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("AGENT_DELEGATION_", "DELEGATION_FIXTURE_"))}
+            env.update(AGENT_DELEGATION_CONFIG=str(registry),
+                       DELEGATION_FIXTURE_HOME=str(root / "native-home"),
+                       DELEGATION_FIXTURE_STATE=str(root / "state"),
+                       NODE_OPTIONS="--require " + str(preload))
+
+            def run(*options: str) -> dict:
+                result = subprocess.run([sys.executable, str(SCRIPT), "run", "--to", "fixture", "--cwd", str(root),
+                                         "--task", "CASE:effort", *options], env=env, text=True,
+                                        capture_output=True, timeout=30)
+                return json.loads(result.stdout)
+
+            def current(payload: dict) -> str:
+                return next(option["current_value"] for option in payload["config_options"] if option["id"] == "effort")
+
+            try:
+                if acpx_version() == "0.13.2":
+                    # ACPX 0.13.2 has no one-shot --config-option; the turn fails before any prompt.
+                    payload = run("--config-option", "effort=high")
+                    self.assertEqual(payload["status"], "error")
+                    self.assertEqual(payload["prompt_request_count"], 0)
+                else:
+                    payload = run("--config-option", "effort=high")
+                    self.assertEqual(payload["status"], "success", payload)
+                    self.assertEqual(payload["assistant_text"], "effort=high:turn=1")
+                    self.assertEqual(payload["requested_config_options"], [["effort", "high"]])
+                    self.assertEqual(current(payload), "high")
+                    self.assertEqual(payload["config_options"][0]["values"], ["low", "medium", "high"])
+
+                payload = run("--session", "configured", "--config-option", "effort=low")
+                self.assertEqual(payload["status"], "success", payload)
+                self.assertEqual(payload["assistant_text"], "effort=low:turn=1")
+                self.assertEqual(current(payload), "low")
+                followup = run("--session", "configured")
+                self.assertEqual(followup["assistant_text"], "effort=low:turn=2", "A session keeps its selection")
+                self.assertEqual(followup["requested_config_options"], [])
+
+                rejected = run("--session", "configured", "--config-option", "effort=ultra")
+                self.assertEqual(rejected["status"], "error")
+                self.assertEqual(rejected["prompt_request_count"], 0)
+                # The warm owner sends no catalog on these turns; the result reads ACPX's saved
+                # record, which keeps the accepted selection and not the rejected one.
+                self.assertEqual(current(followup), "low")
+                self.assertEqual(current(rejected), "low")
+                self.assertEqual(json.loads((root / "state" / (payload["acp_session_id"] + ".json")).read_text()), 2,
+                                 "A rejected selection must stop the turn before the prompt")
+            finally:
+                subprocess.run([sys.executable, str(SCRIPT), "close", "--to", "fixture", "--cwd", str(root),
+                                "--session", "configured"], env=env, capture_output=True, timeout=20)
+
     def test_clean_followup_does_not_inherit_permission_denial(self) -> None:
         with tempfile.TemporaryDirectory(prefix="delegation-permission-turn-") as temporary:
             root = Path(temporary)
@@ -154,9 +242,14 @@ class NativeTransportTests(unittest.TestCase):
                     self.assertEqual(payload["stop_reason"], "end_turn")
                     self.assertEqual(result.returncode, 0 if expected == "success" else 5)
                     if case == "clean-followup":
-                        self.assertEqual(payload["exit_code"], 5, "The native stale exit code must remain inspectable")
                         self.assertEqual(payload["permission_request_count"], 0)
-                        self.assertIn("cumulative", payload["status_note"])
+                        if acpx_version() == "0.13.2":
+                            self.assertEqual(payload["exit_code"], 5, "The native stale exit code must remain inspectable")
+                            self.assertIn("cumulative", payload["status_note"])
+                        else:
+                            # Later ACPX releases report the clean turn directly; nothing is reconciled.
+                            self.assertEqual(payload["exit_code"], 0)
+                            self.assertIsNone(payload.get("status_note"))
             finally:
                 subprocess.run([sys.executable, str(SCRIPT), "close", "--to", "fixture", "--cwd", str(root),
                                 "--session", "permission-followup"], env=env, capture_output=True, timeout=20)
@@ -429,8 +522,18 @@ class NativeTransportTests(unittest.TestCase):
                 task_control("cancel", early)
                 result = task_control("wait", early, 15)
                 self.assertEqual(result["status"], "cancelled")
-                self.assertEqual(result["stop_reason"], "cancelled")
                 self.assertEqual(result["cancellation_exit_code"], 0)
+                if acpx_version() == "0.13.2":
+                    # ACPX 0.13.2 still sends the prompt, then cancels the native turn.
+                    self.assertEqual(result["stop_reason"], "cancelled")
+                else:
+                    # Later ACPX withdraws the prompt during admission; the agent never receives it.
+                    self.assertIsNone(result["stop_reason"])
+                    self.assertEqual(result["prompt_request_count"], 0)
+                    self.assertIn("session/prompt", result["status_note"])
+                    time.sleep(2)
+                    turns = root / "state" / (result["acp_session_id"] + ".json")
+                    self.assertEqual(json.loads(turns.read_text()), 0)
                 timed_out = run("wait", timeout=2)
                 self.assertEqual(timed_out["status"], "timeout")
                 self.assertEqual(timed_out["timeout_phase"], "execution")

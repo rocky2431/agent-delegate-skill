@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.8.0。
+版本：0.11.0。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -235,6 +235,9 @@ agent-delegate submit --to codex --cwd /absolute/path/to/project \
 同一命名会话中的任务依次运行。不同会话和未指定 `--session` 的任务可以独立
 运行，实际并发仍受目标自身能力影响。工作者不会自动继承调用方的完整对话或
 模型。Mission 需要带上必要上下文；只有确实需要指定目标模型时才传 `--model`。
+`--config-option KEY=VALUE` 用于选择目标公布的 ACP 会话设置，例如推理强度
+（Codex 用 `--config-option reasoning_effort=high`）；每个结果都会列出目标的
+`config_options`。
 
 三个 timeout 选项管理不同的计时：
 
@@ -360,9 +363,9 @@ python3 scripts/install_user.py uninstall --remove-runtime
 
 ## 开发
 
-仓库在 `runtime/package-lock.json` 中保存可复现的开发快照：ACPX 0.13.2、
-`@agentclientprotocol/claude-agent-acp` 0.75.1 和
-`@agentclientprotocol/codex-acp` 1.10.0。用户 runtime 独立升级，不会在普通
+仓库在 `runtime/package-lock.json` 中保存可复现的开发快照：ACPX 0.21.0、
+`@agentclientprotocol/claude-agent-acp` 0.95.0、
+`@agentclientprotocol/codex-acp` 2.2.2、`pi-acp` 0.0.33 和 `zcode-acp-server` 0.76.2。用户 runtime 独立升级，不会在普通
 Skill 更新时自动回退到这份快照。
 
 在仓库根目录运行标准检查：

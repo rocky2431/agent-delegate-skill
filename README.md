@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.10.0.
+Version: 0.11.0.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -319,6 +319,9 @@ Tasks in the same named session wait their turn. Different sessions and tasks
 without `--session` can run independently, subject to the target's own capacity.
 The worker does not inherit the caller's full conversation or model. Pass the
 context it needs, and use `--model` only when a specific target model matters.
+`--config-option KEY=VALUE` selects an advertised ACP session setting, such as
+reasoning effort (`--config-option reasoning_effort=high` for Codex); each
+result lists the target's `config_options`.
 
 The three timeout options control different clocks:
 
@@ -455,9 +458,10 @@ Only files with this package's managed marker are removed.
 
 ## Development
 
-The repository keeps a reproducible development snapshot of ACPX 0.13.2,
-`@agentclientprotocol/claude-agent-acp` 0.75.1, and
-`@agentclientprotocol/codex-acp` 1.10.0 in `runtime/package-lock.json`. User
+The repository keeps a reproducible development snapshot of ACPX 0.21.0,
+`@agentclientprotocol/claude-agent-acp` 0.95.0,
+`@agentclientprotocol/codex-acp` 2.2.2, `pi-acp` 0.0.33 and `zcode-acp-server` 0.76.2
+in `runtime/package-lock.json`. User
 runtime upgrades are managed separately and do not silently return to this
 snapshot.
 

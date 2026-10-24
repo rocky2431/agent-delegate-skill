@@ -306,7 +306,9 @@ class DelegateEntryTests(unittest.TestCase):
         code, messages, stderr = self.run_entry(self.request("CASE: happy"))
         self.assertEqual(code, 0, stderr)
         started = next(m for m in messages if m.get("type") == "started")
-        self.assertEqual(started["acpx_version"], "0.13.2")
+        loaded = json.loads((Path(RUNTIME_ROOT) / "node_modules/acpx/package.json")
+                            .read_text(encoding="utf-8"))["version"]
+        self.assertEqual(started["acpx_version"], loaded)
         result = next(m for m in messages if m.get("type") == "result")
         self.assertEqual(result["result"]["status"], "completed")
         self.assertEqual(result["result"]["stopReason"], "end_turn")

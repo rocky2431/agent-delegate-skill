@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import zcode_runtime
 
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
@@ -284,14 +284,59 @@ def _session_update(item: dict[str, Any]) -> dict[str, Any]:
     return update if isinstance(update, dict) else {}
 
 
+def _adapter_notice(update: dict[str, Any], content: dict[str, Any],
+                    startup_info: dict[str, str]) -> dict[str, Any] | None:
+    # Adapters label status text that is not the agent's answer: claude-agent-acp
+    # marks hook notices informational; pi-acp declares its startup block in session/new.
+    meta = update.get("_meta")
+    for source, value in (meta.items() if isinstance(meta, dict) else ()):
+        if isinstance(value, dict) and value.get("kind") == "informational":
+            return {"source": source, "kind": "informational", "level": value.get("level"), "content": content}
+    text = content.get("text")
+    if content.get("type") == "text" and isinstance(text, str) and text in startup_info:
+        return {"source": startup_info[text], "kind": "startup_info", "level": None, "content": content}
+    return None
+
+
+def _config_catalog(options: list[Any]) -> list[dict[str, Any]]:
+    catalog = []
+    for option in options:
+        if not isinstance(option, dict) or not isinstance(option.get("id"), str):
+            continue
+        values: list[str] = []
+        for choice in option.get("options") or []:
+            group = choice.get("options") if isinstance(choice, dict) and isinstance(choice.get("options"), list) else [choice]
+            values += [item["value"] for item in group if isinstance(item, dict) and isinstance(item.get("value"), str)]
+        catalog.append({"id": option["id"], "category": option.get("category"),
+                        "current_value": option.get("currentValue"), "values": values})
+    return catalog
+
+
+def _saved_config_options(command: list[str], env: dict[str, str]) -> list[dict[str, Any]] | None:
+    # ACPX keeps the catalog and the accepted selections, which it replays before the
+    # next prompt, in the session record. ACPX 0.13.2 can leave the catalog stale after
+    # a rejected selection while the saved selections stay accurate, so they win.
+    try:
+        completed = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30, check=False)
+        record = json.loads(completed.stdout)["acpx"]
+        catalog, desired = record["config_options"], record.get("desired_config_options") or {}
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(catalog, list) or not isinstance(desired, dict):
+        return None
+    return [{**option, "current_value": desired.get(option["id"], option["current_value"])}
+            for option in _config_catalog(catalog)]
+
+
 def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, Any]:
-    contents: list[dict[str, Any]] = []
+    chunks: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    startup_info: dict[str, str] = {}
     errors: list[dict[str, Any]] = []
     methods: dict[object, str] = {}
     result: dict[str, Any] = {
         "stop_reason": None, "acp_session_id": None, "acpx_record_id": None,
         "parsed_event_count": 0, "unparsed_event_count": 0,
-        "permission_request_count": 0,
+        "permission_request_count": 0, "prompt_request_count": 0, "config_options": None,
     }
     for line in events:
         if not line.strip():
@@ -310,17 +355,24 @@ def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, A
         request_id = item.get("id")
         if isinstance(request_id, (str, int)) and isinstance(item.get("method"), str):
             methods[request_id] = item["method"]
+            if item["method"] == "session/prompt":
+                result["prompt_request_count"] += 1
         update = _session_update(item)
         if update.get("sessionUpdate") == "agent_message_chunk":
             content = update.get("content")
             if isinstance(content, dict):
-                contents.append(content)
+                chunks.append((update, content))
         params = item.get("params")
         if isinstance(params, dict) and isinstance(params.get("sessionId"), str):
             result["acp_session_id"] = params["sessionId"]
         response = item.get("result")
         if not isinstance(response, dict) and isinstance(item.get("action"), str):
             response = item
+        # session/new and load results, set_config_option replies, ACPX config_set
+        # events and config updates each carry the full catalog; the latest is current.
+        catalog = response.get("configOptions") if isinstance(response, dict) else update.get("configOptions")
+        if isinstance(catalog, list):
+            result["config_options"] = _config_catalog(catalog)
         if isinstance(response, dict):
             if isinstance(response.get("stopReason"), str):
                 result["stop_reason"] = response["stopReason"]
@@ -333,6 +385,12 @@ def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, A
                 result["action"] = response["action"]
             if isinstance(response.get("cancelled"), bool):
                 result["cancel_requested"] = response["cancelled"]
+                if response.get("action") == "cancel_result":
+                    result["cancel_acknowledged"] = result.get("cancel_acknowledged", False) or response["cancelled"]
+            meta = response.get("_meta")
+            for source, value in (meta.items() if isinstance(meta, dict) else ()):
+                if isinstance(value, dict) and isinstance(value.get("startupInfo"), str) and value["startupInfo"]:
+                    startup_info[value["startupInfo"]] = source
         error = item.get("error")
         if isinstance(error, dict):
             method = methods.get(request_id) if isinstance(request_id, (str, int)) else None
@@ -341,11 +399,20 @@ def _extract_result(events: Iterable[str], max_chars: int | None) -> dict[str, A
         if "result" in item or "error" in item:
             if isinstance(request_id, (str, int)):
                 methods.pop(request_id, None)
+    contents: list[dict[str, Any]] = []
+    notices: list[dict[str, Any]] = []
+    for update, content in chunks:
+        notice = _adapter_notice(update, content, startup_info)
+        if notice:
+            notices.append(notice)
+        else:
+            contents.append(content)
     full_text = "".join(c.get("text", "") for c in contents if c.get("type") == "text" and isinstance(c.get("text"), str))
     result.update({
         "assistant_text": full_text if max_chars is None else full_text[:max_chars],
         "assistant_text_truncated": max_chars is not None and len(full_text) > max_chars,
         "assistant_content": contents,
+        "notices": notices,
         "rpc_errors": errors,
         "tool_errors": [error for error in errors if error["scope"] == "tool"],
         # Keep the legacy field, without labeling ordinary client operations as protocol failures.
@@ -386,6 +453,35 @@ def _result_status(code: int, parsed: dict[str, Any], interrupted: str | None, c
     if stop == "refusal":
         return "refused"
     return "error" if parsed["protocol_errors"] and not stop else "incomplete"
+
+
+def _cancelled_turn_status(status: str, parsed: dict[str, Any], cancellation_exit_code: int,
+                           interrupted: str | None) -> str:
+    if cancellation_exit_code == 0 and parsed["stop_reason"] in ("cancelled", "end_turn"):
+        return status
+    # ACPX 0.18+ withdraws a turn cancelled during prompt admission, so no stop
+    # reason exists. Accept that only when ACPX acknowledged the cancel and the
+    # fully parsed stream, which records every sent prompt, shows none for this turn.
+    if (cancellation_exit_code == 0 and interrupted == "cancelled" and parsed["stop_reason"] is None
+            and parsed.get("cancel_acknowledged") and parsed.get("prompt_request_count") == 0
+            and parsed.get("unparsed_event_count") == 0 and not parsed.get("rpc_errors")):
+        parsed["status_note"] = ("ACPX acknowledged the cancellation before this turn sent a "
+                                 "session/prompt request; the agent was not given the mission.")
+        return "cancelled"
+    return "incomplete"
+
+
+def _parse_config_options(raw: list[str]) -> list[list[str]]:
+    selected = []
+    for item in raw:
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value:
+            raise DelegationError(f"--config-option must be KEY=VALUE: {item!r}")
+        if key.startswith("-") or value.startswith("-"):
+            # ACPX `set` takes them as positional arguments, where a leading dash reads as an option.
+            raise DelegationError(f"--config-option key and value must not start with '-': {item!r}")
+        selected.append([key, value])
+    return selected
 
 
 def _positive_int(raw: Any, label: str) -> int:
@@ -586,14 +682,18 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
         base.append("--no-terminal")
     if args.model:
         base.extend(["--model", args.model])
+    config_options = _parse_config_options(getattr(args, "config_option", None) or [])
     if control:
         suffix = ["cancel", "--session", args.session] if args.command == "cancel" else ["sessions", "close", args.session]
         commands = [(base + suffix, "")]
     elif args.session:
+        # A named session saves each accepted selection and replays it on reconnect.
         commands = [(base + ["sessions", "ensure", "--name", args.session], ""),
+                    *[(base + ["set", key, value, "--session", args.session], "") for key, value in config_options],
                     (base + ["prompt", "--session", args.session, "--file", "-"], prompt)]
     else:
-        commands = [(base + ["exec", "--file", "-"], prompt)]
+        commands = [(base + ["exec", *[arg for key, value in config_options
+                                       for arg in ("--config-option", f"{key}={value}")], "--file", "-"], prompt)]
     request = {
         "schema": "agent-delegation-request/v1", "delegation_id": delegation_id,
         "created_at": datetime.now(UTC).isoformat(), "caller": caller, "target": args.to,
@@ -604,6 +704,7 @@ def _prepare_run(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, An
         "task_chars": len(task), "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
         "target_argv": selected_argv if selected_argv in target.get("legacy_argv", []) else target["argv"],
         "session_name": args.session, "requested_model": args.model,
+        "requested_config_options": config_options,
         "launch_argv": selected_argv,
         "acpx_path": registry["acpx_path"],
         "legacy_session": selected_argv != target.get("launch_argv", target["argv"]),
@@ -748,6 +849,7 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
     def is_cancelled() -> bool:
         return (receipt_dir / "cancel.json").exists()
     return_code, interrupted, launch_error, cancellation_exit_code = 1, None, None, None
+    saved_config = None
     def handle_termination(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt
     previous_handler = signal.signal(signal.SIGTERM, handle_termination)
@@ -796,6 +898,11 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
                     finally:
                         if interrupted and session and prompt_started and not control and cancellation_exit_code is None:
                             cancel_named_turn()
+                    if session and not control:
+                        # A warm session sends no catalog on later turns. Read ACPX's saved
+                        # record while this turn still holds the session.
+                        saved_config = _saved_config_options(
+                            commands[-1][0][:-5] + ["sessions", "show", session], child_env)
             except KeyboardInterrupt:
                 return_code, interrupted = 130, "cancelled"
             except TimeoutError as exc:
@@ -811,6 +918,8 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
         queue_wait = time.monotonic() - started
     with (receipt_dir / "events.ndjson").open(encoding="utf-8", errors="replace") as events:
         parsed = _extract_result(events, launch["max_result_chars"])
+    if parsed["config_options"] is None:
+        parsed["config_options"] = saved_config
     if not control and runtime_launch and runtime_launch["target"].get("adapter_package") == "pi-acp":
         from pi_result import reconcile_pi_result
         reconcile_pi_result(parsed, request)
@@ -826,14 +935,13 @@ def _execute_run(receipt_dir: Path, launch: dict[str, Any]) -> int:
     acpx_identity = (runtime_identity or {}).get("acpx") or _package_identity(commands[-1][0][0], "acpx")
     status = _result_status(return_code, parsed, interrupted, control,
                             acpx_version=acpx_identity.get("version"), named_session=session is not None)
-    if cancellation_exit_code is not None and (
-        cancellation_exit_code != 0 or parsed["stop_reason"] not in ("cancelled", "end_turn")
-    ):
-        status = "incomplete"
+    if cancellation_exit_code is not None:
+        status = _cancelled_turn_status(status, parsed, cancellation_exit_code, interrupted)
     result = {
         "schema": "agent-delegation-result/v1", **parsed, "status": status,
         **{key: request[key] for key in ("delegation_id", "caller", "target", "chain", "cwd",
                                          "session_name", "requested_model", "operation")},
+        "requested_config_options": request.get("requested_config_options", []),
         "exit_code": return_code, "terminal": True,
         "timeout_seconds": timeout, "cancellation_exit_code": cancellation_exit_code,
         "queue_timeout_seconds": request["queue_timeout_seconds"],
@@ -1524,6 +1632,8 @@ def _build_parser() -> argparse.ArgumentParser:
         run_parser.add_argument("--queue-timeout", type=int, help="Optional queue wait limit in seconds; omitted to wait until admitted or cancelled.")
         run_parser.add_argument("--session", help="Ensure and continue a named native ACPX session.")
         run_parser.add_argument("--model", help="Explicit target model; omitted to retain target defaults.")
+        run_parser.add_argument("--config-option", action="append", metavar="KEY=VALUE",
+                                help="Explicit ACP session config selection, such as reasoning effort; repeatable.")
         run_parser.add_argument(
             "--permissions",
             choices=sorted(PERMISSION_FLAGS),

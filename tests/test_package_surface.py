@@ -13,7 +13,7 @@ class PackageSurfaceTests(unittest.TestCase):
     def test_native_manifests_share_one_skill_tree(self) -> None:
         plugin = REPO_ROOT / "plugins/agent-delegation"
         expected = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
-        for relative in (".claude-plugin/plugin.json", ".zcode-plugin/plugin.json", "kimi.plugin.json"):
+        for relative in (".claude-plugin/plugin.json", ".zcode-plugin/plugin.json", "kimi.plugin.json", "package.json"):
             manifest = json.loads((plugin / relative).read_text())
             self.assertEqual(manifest["name"], expected["name"])
             self.assertEqual(manifest["version"], expected["version"])
@@ -64,21 +64,21 @@ class PackageSurfaceTests(unittest.TestCase):
         lock = json.loads((REPO_ROOT / "runtime/package-lock.json").read_text(encoding="utf-8"))
         expected = {
             "zcode-acp-server": (
-                "0.46.6",
-                "sha512-r2uUItqcQhzPDJ8ckRxJvEocThWW7+ObjN9/wTz7M6b5+RSbeIOdtoUL1RCmJ44FxfpJIAIGEeY3uoAYbLBpTg==",
+                "0.76.2",
+                "sha512-HH+nqG9ccQN/SDoH57zQ+e2u41aEkjAPFMOXRU7BmyDu6iTDqvIO3ioQrkeHDjaWIa3e3BScxorcKgo7ErVCrg==",
             ),
             "pi-acp": ('0.0.33', 'sha512-vX9kY1tK14E72G4dBAx+RGCk/k7XPjTHls6dLUxA8WSkBav6B6JHuSBv3eusp50LCR/GTRsR2kIKsG0Z5jANzw=='),
             "acpx": (
-                "0.13.2",
-                "sha512-4hOLEo2kE/nCrPr50StbzU3G1WvzHkmKE/r3vxFAIr6GRI3VSmSRH62XCtnDpVcQNpBM8fVPAeTj39ewVhJwdQ==",
+                "0.21.0",
+                "sha512-+X1QZgsbO/9Zuk1QKMzcwdAEsvZ/4Ta4IQpeFwTmxY68qLjX82jFTAPXB51SWcH8galIYm81xMHxSZgxc06Ipg==",
             ),
             "@agentclientprotocol/claude-agent-acp": (
-                "0.75.1",
-                "sha512-Un6I4BRkhpCFS3I7kr5C/lkAm8Nc3VuGZU2YQ3xIpJAIxV94iWO0Q2CH2QABxMERpONRu4Le6XC9V+5PImQZ2A==",
+                "0.95.0",
+                "sha512-9ocOKHfeGrSwXshLdaweYvRSdzy5fltbk+WiG2t7bQXW+882hiyrvZzUOhZ9k8ItwdLfpXcnytVlyDbjMdHDIA==",
             ),
             "@agentclientprotocol/codex-acp": (
-                "1.10.0",
-                "sha512-b4dDCPkH/GgHRb3JelXz4QdNirdoTjO3yYM1ImUJMxVXxgZLZMguEXNhZOH2G755UKzf6ZypiiC7UHe3fKgp2Q==",
+                "2.2.2",
+                "sha512-vNdeNV3jxbqaH7MYvVWzyB6cMOz+YGIV9W1xyBDsQfoii92DulZLM+ahCL2T2G6uohlaB1Yma347p2kLfAab2w==",
             ),
         }
         self.assertEqual(

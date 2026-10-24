@@ -128,7 +128,7 @@ A cancellation acknowledgement is not proof that work stopped. Use task-ID cance
 
 A native `cancelled` stop reason confirms that the model turn was interrupted. Spawned terminal commands or background jobs may survive it, as observed with Codex. When those jobs also need to stop, inspect and stop the specific jobs through the target's native controls; do not infer process cleanup from the turn's stop reason.
 
-The worker does not automatically inherit the caller's conversation or model. Pass the context it needs; use `--model` only for an explicit model choice, otherwise retain the target's defaults. The wrapper launches the registered argv and records provenance. Agent names may repeat in the chain. Nested workers inherit caller/chain metadata. When metadata is absent, set `--caller` to your actual host label if known; otherwise retain `unknown`. Supply `--chain` only from known provenance.
+The worker does not automatically inherit the caller's conversation or model. Pass the context it needs; use `--model` only for an explicit model choice, otherwise retain the target's defaults. Likewise pass `--config-option KEY=VALUE` (repeatable) only for an explicit session setting such as reasoning effort; each result lists the advertised `config_options`, and reasoning effort is the option in category `thought_level`. See [session configuration](references/operations.md#session-configuration-options). The wrapper launches the registered argv and records provenance. Agent names may repeat in the chain. Nested workers inherit caller/chain metadata. When metadata is absent, set `--caller` to your actual host label if known; otherwise retain `unknown`. Supply `--chain` only from known provenance.
 
 ## Authority and capabilities
 
@@ -143,7 +143,7 @@ Use `approve-reads`, `deny-all`, or `--no-terminal` only for an intentional capa
 
 ## Read the result
 
-The start message on stderr identifies a private receipt directory. Events and diagnostics are written there during execution. The final JSON includes the stop reason, text, content blocks, session identity, structured errors, and receipt path; partial output survives timeout and cancellation.
+The start message on stderr identifies a private receipt directory. Events and diagnostics are written there during execution. The final JSON includes the stop reason, text, content blocks, session identity, structured errors, and receipt path; partial output survives timeout and cancellation. Status text an adapter marks as outside the answer, such as Claude hook notices or Pi's startup block, is kept in `notices`, not in `assistant_text`.
 
 Keep the delegation ID, terminal receipt and actual output references in the existing
 task record, if present; do not create a second progress ledger merely for dispatch.
@@ -164,11 +164,11 @@ rejected rather than presented as effective restrictions. The receipt reconciles
 ACP `end_turn` with this mission in the mapped native Pi session; missing native
 evidence is `incomplete`. A native model error is not successful delegation.
 
-There is no default task/result character cap. Timeout and depth come from the registry; `doctor --to <target> --json` shows effective limits and target health. Run it when diagnosing a failure, not as a mandatory gate before each delegation.
+The wrapper sets no default task/result character cap; ACPX itself rejects a single incoming ACP message above 64 MiB unless `ACPX_MAX_ACP_MESSAGE_BYTES` raises it. Timeout and depth come from the registry; `doctor --to <target> --json` shows effective limits and target health. Run it when diagnosing a failure, not as a mandatory gate before each delegation.
 
 Raw event streams grow without limit. `compact` losslessly gzips those of finished receipts and deletes nothing; see [compact finished receipts](references/operations.md#compact-finished-receipts).
 
-Managed targets use the installed local CLI; Codex and Claude adapters bind it explicitly. `runtime_identity` separates CLI, adapter, and ACPX versions observed at startup. A warm session may still use its earlier process. A legacy session without a startup record is marked unverified. Ordinary Skill updates preserve the installed runtime; an explicit `install --update-runtime` upgrades it. See [operations.md](references/operations.md) for update and recovery details.
+Managed targets use the installed local CLI; Codex and Claude adapters bind it explicitly. `runtime_identity` separates CLI, adapter, and ACPX versions observed at startup. A warm session may still use its earlier process. A legacy session without a startup record is marked unverified. Ordinary Skill updates preserve the installed runtime; an explicit `install --update-runtime` upgrades it. After an upgrade, let old warm sessions go idle before continuing them, or close them. See [operations.md](references/operations.md) for update and recovery details.
 
 The managed zCode target uses `zcode-acp-server` over the local CLI app-server. It resolves the CLI, account, and configured model at startup; it never guesses a fallback model. Use `install --update-zcode-adapter --targets zcode` for a targeted bridge update. See [zCode runtime](references/operations.md#zcode-runtime) for discovery overrides and readiness diagnostics.
 

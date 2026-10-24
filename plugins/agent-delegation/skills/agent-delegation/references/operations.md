@@ -35,10 +35,56 @@ are preserved, including longer owner-configured budgets. `--timeout` must fit t
 configured maximum; `--max-depth` may lower the inherited/configured ceiling.
 Neither budget counts sibling tasks or constitutes a semantic authorization gate.
 
-Task and result text have no default character cap. Optional positive
+Task and result text have no default character cap in the wrapper. Optional positive
 `max_task_chars` limits input; `max_result_chars` limits the convenience
-`assistant_text` field. `assistant_content` and the event file preserve the full
-content. All configured limits are validated before the worker starts.
+`assistant_text` field. `assistant_content` keeps the agent's full answer blocks and
+the event file keeps every message. All configured limits are validated before the
+worker starts. ACPX 0.15.1 and later rejects a single incoming ACP message above
+64 MiB by default; set `ACPX_MAX_ACP_MESSAGE_BYTES` in the environment that starts
+the wrapper to raise it, or `0` to disable it. A warm session owner keeps the value
+it started with.
+
+Status text that an adapter marks as outside the answer goes to `notices`, not
+`assistant_text` or `assistant_content`: hook notices that claude-agent-acp tags
+`_meta.claudeCode.kind: informational`, and the startup block that pi-acp declares
+as `_meta.piAcp.startupInfo` in its `session/new` response. Each notice keeps its
+source, kind, level and content block. Unmarked text stays in the answer.
+
+## Session configuration options
+
+Adapters advertise session settings as ACP config options in their `session/new`
+or `session/load` response. Each result reports the latest catalog in
+`config_options` (`id`, `category`, `current_value`, `values`), so a first
+delegation shows which keys a target accepts. A later turn on a warm named
+session receives no new catalog; the wrapper then reads ACPX's saved session
+record while it still holds the session, taking `current_value` from the
+selections ACPX replays before the next prompt. `null` means no catalog was
+observed. Select one explicitly with
+`--config-option KEY=VALUE`, repeatable; omit it to keep the target's defaults.
+`requested_config_options` records the selection in the receipt.
+
+A one-shot task passes the selections to `acpx exec --config-option` (ACPX 0.14
+and later). A named session applies each with `acpx set` after `sessions ensure`
+and before the prompt; ACPX saves the accepted value and replays it on reconnect,
+so later turns keep it until another selection replaces it. ACPX forwards keys and
+values unchecked. The adapter validates them: a rejected selection ends the task
+with `status: error` before any prompt is sent (`prompt_request_count: 0`).
+
+Reasoning effort is the option whose category is `thought_level`. Observed on
+2026-10-24 with ACPX 0.21.0:
+
+| Target | Adapter / CLI | Effort option id | Advertised values |
+|---|---|---|---|
+| codex | codex-acp 2.2.2, codex-cli 0.159.3 | `reasoning_effort` | `low` `medium` `high` `xhigh` `max` `ultra` |
+| claude | claude-agent-acp 0.95.0, Claude Code 2.1.310 | `effort` | `default` `low` `medium` `high` `xhigh` `max` |
+| grok | grok 1.0.70 | `reasoning_effort` | `xhigh` `high` `medium` `low` |
+| zcode | zcode-acp-server 0.76.2 | `thought` | `low` `high` `max` |
+| pi | pi-acp 0.0.33, Pi 1.4.0 | `thought_level` | from the Pi model |
+
+Codex accepted `reasoning_effort=low` and rejected `reasoning_effort=bogus` with
+`Invalid params`; Claude accepted `effort=low`. Catalogs change with adapter and
+model versions, so read the current `config_options` instead of relying on this
+table.
 
 ## Task observation and time budgets
 
@@ -308,6 +354,14 @@ and current local CLI. Pre-launcher named sessions are discovered through ACPX's
 local index and continue under their original command. They remain in the old
 runtime until closed; their CLI identity is unverified without a startup record.
 
+ACPX 0.18 and 0.19 strengthened queue-owner handoff and process-identity checks,
+and those guarantees need updated clients and owners. After
+`install --update-runtime`, let a warm owner started by the older ACPX finish and
+go idle before continuing its session, or close the session and start a fresh
+one. Mixed versions keep the older race conditions; a healthy legacy owner stays
+usable. See the [v0.18.0](https://github.com/openclaw/acpx/releases/tag/v0.18.0)
+and [v0.19.0](https://github.com/openclaw/acpx/releases/tag/v0.19.0) upgrade notes.
+
 For one task, including a queued task, use:
 
 ```bash
@@ -321,6 +375,14 @@ ownership is lost, the snapshot reports `incomplete` with
 events, partial output, and the native session before retrying a task with effects.
 Elapsed timing fields are `null` when wrapper ownership is lost, because neither
 the final duration nor time spent in each phase can be established.
+
+A cancellation can land while the adapter is still starting, before the turn's
+prompt is sent. ACPX 0.18 and later then withdraws the prompt and reports no ACP
+stop reason; ACPX 0.13.2 still sent the prompt and cancelled the native turn. The
+wrapper reports `cancelled` without a stop reason only when ACPX acknowledged the
+cancellation and the event stream, which records every sent `session/prompt`, has
+none for this turn: `prompt_request_count` is 0 and `status_note` says so. Without
+that evidence the result stays `incomplete`.
 
 Native cancellation interrupts a model turn; it does not guarantee that every
 spawned terminal command has stopped. In the Codex 0.153.4 / codex-acp 1.10.0 live

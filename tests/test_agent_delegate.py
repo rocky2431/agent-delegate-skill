@@ -881,6 +881,105 @@ class AgentDelegateCliTests(unittest.TestCase):
             self.assertEqual(wrapper._result_status(5, wrapper._extract_result(events, None), None, False,
                              acpx_version=version, named_session=named), "denied")
 
+    def test_adapter_notices_stay_out_of_assistant_text(self) -> None:
+        spec = importlib.util.spec_from_file_location("adapter_notices", SCRIPT)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+
+        def chunk(text: str, **update: object) -> str:
+            return json.dumps({"method": "session/update", "params": {"update": {
+                "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}, **update}}})
+
+        startup = "pi v1.4.0\n---\n\n## Skills\n- example\n"
+        events = [chunk(startup),  # pi-acp emits its startup block before the response is read.
+                  json.dumps({"id": 1, "result": {"sessionId": "s", "_meta": {"piAcp": {"startupInfo": startup}}}}),
+                  chunk("**Notice:** hook says hi", _meta={"claudeCode": {"kind": "informational", "level": "notice"}}),
+                  chunk("PONG", messageId="m1"),
+                  chunk(startup.strip()),  # Only the declared startup text is a notice.
+                  json.dumps({"id": 2, "result": {"stopReason": "end_turn"}})]
+        parsed = wrapper._extract_result(events, None)
+        self.assertEqual(parsed["assistant_text"], "PONG" + startup.strip())
+        self.assertEqual([c["text"] for c in parsed["assistant_content"]], ["PONG", startup.strip()])
+        self.assertEqual([(n["source"], n["kind"], n["level"]) for n in parsed["notices"]],
+                         [("piAcp", "startup_info", None), ("claudeCode", "informational", "notice")])
+        self.assertEqual(parsed["notices"][1]["content"]["text"], "**Notice:** hook says hi")
+        plain = wrapper._extract_result([chunk("ok", _meta={"claudeCode": {"kind": "answer"}})], None)
+        self.assertEqual((plain["assistant_text"], plain["notices"]), ("ok", []))
+
+    def test_config_options_precede_the_prompt_and_report_the_current_catalog(self) -> None:
+        base = ["run", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture", "--dry-run",
+                "--config-option", "reasoning_effort=high", "--config-option", "fast-mode=on"]
+        one_shot = json.loads(self.run_cli(*base).stdout)
+        self.assertEqual(one_shot["requested_config_options"], [["reasoning_effort", "high"], ["fast-mode", "on"]])
+        exec_args = one_shot["command"][one_shot["command"].index("exec"):]
+        self.assertEqual(exec_args, ["exec", "--config-option", "reasoning_effort=high",
+                                     "--config-option", "fast-mode=on", "--file", "-"])
+        session = json.loads(self.run_cli(*base, "--session", "review").stdout)
+        steps = [command[command.index("--non-interactive-permissions") + 2:] for command in session["commands"]]
+        self.assertEqual(steps, [["sessions", "ensure", "--name", "review"],
+                                 ["set", "reasoning_effort", "high", "--session", "review"],
+                                 ["set", "fast-mode", "on", "--session", "review"],
+                                 ["prompt", "--session", "review", "--file", "-"]])
+        for invalid in ("effort", "=high", "effort=", "--config-option=-effort=high", "effort=-high"):
+            option = [invalid] if invalid.startswith("--") else ["--config-option", invalid]
+            result = self.run_cli("run", "--to", "beta", "--cwd", str(self.cwd), "--task", "fixture", "--dry-run", *option)
+            self.assertNotEqual(result.returncode, 0, invalid)
+            self.assertIn("--config-option", result.stdout + result.stderr)
+
+        spec = importlib.util.spec_from_file_location("config_catalog", SCRIPT)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        option = {"type": "select", "id": "model", "category": "model", "currentValue": "a",
+                  "options": [{"value": "a", "name": "A"}, {"group": "more", "name": "More",
+                                                            "options": [{"value": "b", "name": "B"}]}]}
+        events = [json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s", "configOptions": [option]}}),
+                  json.dumps({"action": "config_set", "configId": "model", "value": "b",
+                              "configOptions": [{**option, "currentValue": "b"}]})]
+        self.assertEqual(wrapper._extract_result(events, None)["config_options"],
+                         [{"id": "model", "category": "model", "current_value": "b", "values": ["a", "b"]}])
+        self.assertIsNone(wrapper._extract_result(events[:0], None)["config_options"])
+
+        def saved(record: object) -> object:
+            command = [sys.executable, "-c", "import sys; print(sys.argv[1])", json.dumps(record)]
+            return wrapper._saved_config_options(command, dict(os.environ))
+
+        # A stale catalog yields to the selection ACPX replays before the next prompt.
+        self.assertEqual(saved({"acpx": {"config_options": [option], "desired_config_options": {"model": "b"}}}),
+                         [{"id": "model", "category": "model", "current_value": "b", "values": ["a", "b"]}])
+        self.assertEqual(saved({"acpx": {"config_options": [option]}})[0]["current_value"], "a")
+        for record in ({"acpx": {}}, {"name": "session"}, {"acpx": {"config_options": {}}}, "not json"):
+            self.assertIsNone(saved(record))
+        self.assertIsNone(wrapper._saved_config_options([str(self.root / "missing-acpx")], dict(os.environ)))
+
+    def test_cancelled_turn_status_requires_evidence_the_prompt_was_withheld(self) -> None:
+        spec = importlib.util.spec_from_file_location("cancelled_turn", SCRIPT)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        ack = json.dumps({"action": "cancel_result", "cancelled": True})
+        refused = json.dumps({"action": "cancel_result", "cancelled": False})
+        prompt = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {}})
+        stopped = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "cancelled"}})
+
+        def status(events: list[str], code: int = 0, interrupted: str | None = "cancelled") -> tuple[str, object]:
+            parsed = wrapper._extract_result(events, None)
+            return wrapper._cancelled_turn_status("cancelled", parsed, code, interrupted), parsed.get("status_note")
+
+        # ACPX 0.13.2 sends the prompt, then reports the native cancellation.
+        self.assertEqual(status([ack, prompt, stopped]), ("cancelled", None))
+        # ACPX 0.18+ withdraws the prompt during admission: no prompt and no stop reason.
+        withheld, note = status([refused, ack, refused])
+        self.assertEqual(withheld, "cancelled")
+        self.assertIn("session/prompt", note)
+        foreign = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"cancelled": True}})
+        for events, code, interrupted in (([ack, prompt], 0, "cancelled"),  # sent, outcome unknown
+                                          ([refused, refused], 0, "cancelled"),  # never acknowledged
+                                          ([foreign, refused], 0, "cancelled"),  # not an ACPX cancel_result
+                                          ([ack, prompt[:30]], 0, "cancelled"),  # unparsed line may be the prompt
+                                          ([ack], 1, "cancelled"),  # cancel command failed
+                                          ([ack], 0, "timeout"),
+                                          ([ack, json.dumps({"error": {"message": "lost"}})], 0, "cancelled")):
+            self.assertEqual(status(events, code, interrupted), ("incomplete", None))
+
     def test_event_wait_reports_lost_worker_and_uncertain_notification_without_replay(self) -> None:
         task_id = "a" * 32
         receipt = self.root / "receipts" / ("test-" + task_id)
