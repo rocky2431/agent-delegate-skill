@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -228,6 +229,66 @@ class InstallerTests(unittest.TestCase):
                     with patch.object(delegate, "_load_registry", return_value=(home, {"targets": {"grok": target}})):
                         with self.assertRaisesRegex(delegate.DelegationError, "cannot be enforced"):
                             delegate._prepare_run(args)
+
+    def test_opencode_native_target_rejects_unenforceable_restrictions(self) -> None:
+        import agent_delegate as delegate
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            executable = home / ".opencode/bin/opencode"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\necho opencode-fixture\n")
+            executable.chmod(0o755)
+            selected = home / "custom bin/opencode"
+            selected.parent.mkdir()
+            selected.symlink_to(executable)
+            for path, expected in (("", executable), (str(selected.parent), selected)):
+                with self.subTest(path=path), patch.dict(os.environ, {"PATH": path}):
+                    target = install_user._build_managed_targets(home, home / "runtime", ["opencode"])["opencode"]
+                self.assertEqual(target["argv"], [str(expected), "acp"])
+            self.assertTrue(target.get("native_local_tools"))
+            delegate._validate_target_record("opencode", target)
+            for flags in (("--permissions", "deny-all"), ("--permissions", "approve-reads"), ("--no-terminal",)):
+                args = delegate._build_parser().parse_args(
+                    ["run", "--to", "opencode", "--cwd", temporary, "--task", "test", *flags])
+                with patch.object(delegate, "_load_registry", return_value=(home, {"targets": {"opencode": target}})):
+                    with self.assertRaisesRegex(delegate.DelegationError, "cannot be enforced"):
+                        delegate._prepare_run(args)
+
+    def test_opencode_skill_destination_follows_opencode_config_dir(self) -> None:
+        home = Path("/tmp/example-home")
+        with patch.dict(os.environ):
+            os.environ.pop("OPENCODE_CONFIG_DIR", None)
+            os.environ.pop("XDG_CONFIG_HOME", None)
+            self.assertEqual(install_user._skill_destination(home, "opencode"),
+                             home / ".config/opencode/skills/agent-delegation")
+            os.environ["XDG_CONFIG_HOME"] = "/tmp/xdg-config"
+            self.assertEqual(install_user._skill_destination(home, "opencode"),
+                             Path("/tmp/xdg-config/opencode/skills/agent-delegation"))
+            os.environ["OPENCODE_CONFIG_DIR"] = "/tmp/opencode-config"
+            self.assertEqual(install_user._skill_destination(home, "opencode"),
+                             Path("/tmp/opencode-config/skills/agent-delegation"))
+
+    def test_opencode_never_discovers_two_skill_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ):
+            # Keep every destination inside the temporary home.
+            os.environ.pop("OPENCODE_CONFIG_DIR", None)
+            os.environ.pop("XDG_CONFIG_HOME", None)
+            home = Path(temporary)
+            for hosts in (["opencode", "claude"], ["codex", "opencode"]):
+                with self.subTest(hosts=hosts), self.assertRaisesRegex(install_user.InstallError, "OpenCode would load"):
+                    install_user._check_opencode_discovery(home, hosts)
+            install_user._check_opencode_discovery(home, ["opencode", "hermes", "pi"])
+            shared = install_user._skill_destination(home, "claude")
+            shared.mkdir(parents=True)
+            with self.assertRaisesRegex(install_user.InstallError, str(shared)):
+                install_user._check_opencode_discovery(home, ["opencode"])
+            install_user._check_opencode_discovery(home, ["hermes", "pi"])
+            shutil.rmtree(shared)
+            install_user._skill_destination(home, "opencode").mkdir(parents=True)
+            with self.assertRaisesRegex(install_user.InstallError, "OpenCode would load"):
+                install_user._check_opencode_discovery(home, ["codex"])
+            install_user._check_opencode_discovery(home, ["opencode", "pi"])
 
     def test_zcode_uses_managed_adapter_without_baked_cli_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

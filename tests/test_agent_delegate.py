@@ -828,7 +828,7 @@ class AgentDelegateCliTests(unittest.TestCase):
 
     def test_collection_without_notification_covers_all_origin_and_target_pairs(self) -> None:
         registry = json.loads(self.registry.read_text())
-        hosts = ("codex", "claude", "zcode", "kimi", "pi")
+        hosts = ("codex", "claude", "zcode", "kimi", "pi", "opencode")
         for name in hosts:
             registry["targets"][name] = registry["targets"]["beta"]
         self.registry.write_text(json.dumps(registry))

@@ -52,6 +52,13 @@ This Skill handles external ACP missions only.
   Grok's command-completion event wakes the same session. Read that event and
   collect once with the full `wait --id <id>`. Keep the native session open.
   Do not use Bash's `run_in_background` argument or detach the observer with `&`.
+- **OpenCode:** submit once with `--caller opencode`, then run `wait --id <id> --event`
+  once through the native `shell` tool with `background: true`, even when the mission
+  looks short. End the turn; OpenCode reports the command's completion and resumes
+  the same session. Read that event and collect once with the full `wait --id <id>`.
+  Never wait in the foreground: release builds stop a foreground command at its
+  shell timeout, which loses the observer while the mission keeps running. Do not
+  append `&` or read the shell's output file while waiting.
 - **Other hosts:** use a native background completion notification when available,
   or one attached wait when the host can keep it alive. Without a wake facility,
   retain the ID and report that limitation; do not emulate one with timed model turns.

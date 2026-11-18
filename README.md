@@ -17,7 +17,7 @@ perspective, and when a task should keep running after the caller stops waiting.
 For a small task that the current agent can finish directly, delegation adds
 nothing.
 
-Version: 0.11.0.
+Version: 0.12.0.
 
 - [Install and start](#install-and-start)
 - [Your first delegation](#your-first-delegation)
@@ -69,7 +69,7 @@ refuses a second copy when that host already has the plugin:
 | Codex portable discovery | `~/.agents/skills/agent-delegation` |
 | Kimi Code | `$KIMI_CODE_HOME/skills/agent-delegation` (default `~/.kimi-code/skills/agent-delegation`) |
 | zCode | `$ZCODE_HOME/skills/agent-delegation` (default `~/.zcode/skills/agent-delegation`) |
-| OpenCode | `~/.config/opencode/skills/agent-delegation` |
+| OpenCode | `$OPENCODE_CONFIG_DIR/skills/agent-delegation`, else `${XDG_CONFIG_HOME:-~/.config}/opencode/skills/agent-delegation` |
 | Pi | `$PI_CODING_AGENT_DIR/skills/agent-delegation` (default `~/.pi/agent/skills/agent-delegation`) |
 
 ### zCode
@@ -159,6 +159,35 @@ and `--no-terminal`, since this adapter cannot enforce them. `end_turn` alone
 is insufficient: the wrapper reads the exact mapped Pi session branch and this
 mission ID, recording the native stop reason. Missing/mismatched evidence is
 `incomplete`; provider errors cannot become `success`.
+
+### OpenCode
+
+```bash
+python3 scripts/install_user.py install --hosts opencode --targets opencode
+```
+
+OpenCode 2.x supplies ACP directly through `opencode acp`; no adapter package is
+needed. OpenCode keeps its own login, providers, model defaults and permission
+rules. Registration uses `opencode` on PATH, falling back to
+`~/.opencode/bin/opencode`. The Skill goes where OpenCode reads its global config:
+`$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`,
+each with `skills/`. Delegate with
+`--caller opencode`, run one `wait --id <id> --event` through OpenCode's `shell`
+tool with `background: true`, and end the turn. OpenCode reports the command's
+completion and resumes the same session, which then collects the result once.
+
+OpenCode also loads Skills from `~/.claude/skills` and `~/.agents/skills` and keeps
+one Skill per name, so a second copy can shadow the one you update. The installer
+refuses any selection, including the default one, that would leave OpenCode with
+two copies. If a portable Claude Code or Codex copy already serves OpenCode, omit
+`opencode` from `--hosts`.
+
+OpenCode runs its own tools and forwards to ACP only the requests its own
+permission rules mark "ask"; it does not use the ACP filesystem or Terminal. The
+managed target therefore rejects `approve-reads`, `deny-all` and `--no-terminal`.
+A target registered by an earlier version lacks this metadata; register it again
+with `--targets opencode`. See the [OpenCode runtime](plugins/agent-delegation/skills/agent-delegation/references/operations.md#opencode-runtime)
+for the observed checks.
 
 ### Codex plugin
 
@@ -407,9 +436,9 @@ native session, and possible effects before retrying.
 - `cwd` and prompts are coordination inputs, not process isolation.
 - The runtime records transport success and structured errors. Semantic acceptance
   still belongs to the caller or an independent verifier.
-- OpenCode is registered, but the latest live checks did not establish a completed
-  round trip because its native ACP path timed out and a separate run returned an
-  authentication error.
+- OpenCode-origin completion delivery was observed through `opencode run`, which
+  waits for the background jobs its prompt started. The interactive TUI uses the
+  same resume mechanism but was not observed separately.
 - Kimi Code uses `$KIMI_CODE_HOME/skills`, defaulting to `~/.kimi-code/skills`. The legacy Python
   `kimi-cli` directory at `~/.kimi` is not migrated or removed, and this package
   does not install recovery hooks.

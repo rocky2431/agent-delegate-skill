@@ -18,7 +18,7 @@ import tomllib
 from typing import Any
 
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 7200
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +55,10 @@ def _skill_destination(home: Path, host: str) -> Path:
         "claude": home / ".claude" / "skills",
         "codex": home / ".agents" / "skills",
         "kimi": Path(os.environ.get("KIMI_CODE_HOME") or home / ".kimi-code").expanduser() / "skills",
-        "opencode": home / ".config" / "opencode" / "skills",
+        # Same resolution as OpenCode: OPENCODE_CONFIG_DIR, then XDG_CONFIG_HOME/opencode.
+        "opencode": Path(os.environ.get("OPENCODE_CONFIG_DIR")
+                         or Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "opencode"
+                         ).expanduser() / "skills",
         "pi": Path(os.environ.get("PI_CODING_AGENT_DIR") or home / ".pi/agent").expanduser() / "skills",
     }
     return roots[host] / "agent-delegation"
@@ -214,6 +217,20 @@ def _check_native_plugin(home: Path, host: str) -> None:
     if any(name.split("@")[0] == "agent-delegation" for name in names):
         raise InstallError(f"{host} already owns agent-delegation as a plugin; update it through "
                            "that host's plugin manager, not a second user Skill installation.")
+
+
+def _check_opencode_discovery(home: Path, hosts: list[str]) -> None:
+    # OpenCode also loads ~/.claude/skills and ~/.agents/skills and keeps one Skill per id,
+    # so a second copy can silently shadow the one this run updates.
+    shared = [host for host in ("claude", "codex")
+              if host in hosts or _skill_destination(home, host).exists()]
+    has_opencode = "opencode" in hosts or _skill_destination(home, "opencode").exists()
+    if shared and has_opencode and ({"opencode", *shared} & set(hosts)):
+        paths = ", ".join(str(_skill_destination(home, host)) for host in shared)
+        raise InstallError(
+            f"OpenCode would load agent-delegation from both {_skill_destination(home, 'opencode')} and "
+            f"{paths}; keep one copy. Omit opencode from --hosts (uninstall --hosts opencode removes an "
+            f"installed copy), or omit and uninstall {','.join(shared)}.")
 
 
 def _install_forwarder(share_root: Path, backup: Path, replace_existing: bool) -> Path:
@@ -377,7 +394,7 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
         "grok": home / ".local/bin/grok",
     }
     for name in names:
-        if name in ("kimi", "grok") and (selected := shutil.which(name)):
+        if name in ("kimi", "grok", "opencode") and (selected := shutil.which(name)):
             candidates[name] = Path(selected)
         executable = (_resolve_executable(home, [], [os.environ.get("ZCODE_NODE") or os.environ.get("ZCODE_ACP_NODE") or "node"]) if name == "zcode"
                       else _resolve_executable(home, [candidates[name]], [name]))
@@ -416,6 +433,9 @@ def _build_managed_targets(home: Path, runtime_root: Path, names: list[str]) -> 
             # Native tools can bypass ACP permissions or fall back when client IO is absent.
             targets[name]["native_local_tools"] = True
             targets[name]["native_fs"] = True
+        elif name == "opencode":
+            # OpenCode forwards only its own "ask" decisions to ACP and never uses client fs/terminal.
+            targets[name]["native_local_tools"] = True
         elif name in ("claude", "codex"):
             targets[name].update(
                 cli_env={"CLAUDE_CODE_EXECUTABLE" if name == "claude" else "CODEX_PATH": str(executable)},
@@ -527,6 +547,7 @@ def _install(args: argparse.Namespace) -> int:
         raise InstallError(f"Missing Skill source {SKILL_SOURCE}.")
     for host in hosts:
         _check_native_plugin(home, host)
+    _check_opencode_discovery(home, hosts)
     backup = _new_backup_dir(home, "install")
     update_zcode = getattr(args, "update_zcode_adapter", False)
     share_root, runtime_root = _install_runtime(home, backup, args.replace_existing, args.update_runtime, update_zcode)

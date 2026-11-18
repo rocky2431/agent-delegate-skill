@@ -14,7 +14,7 @@ ACP Agent。
 停止等待后继续运行时，可以使用 Agent Delegation。当前 Agent 能直接完成的小
 任务无需委派。
 
-版本：0.11.0。
+版本：0.12.0。
 
 - [安装与开始使用](#安装与开始使用)
 - [第一次委派](#第一次委派)
@@ -64,7 +64,7 @@ Portable Skill 使用各宿主的原生用户目录：
 | Codex portable discovery | `~/.agents/skills/agent-delegation` |
 | Kimi Code | `$KIMI_CODE_HOME/skills/agent-delegation`（默认 `~/.kimi-code/skills/agent-delegation`） |
 | zCode | `$ZCODE_HOME/skills/agent-delegation`（默认 `~/.zcode/skills/agent-delegation`） |
-| OpenCode | `~/.config/opencode/skills/agent-delegation` |
+| OpenCode | `$OPENCODE_CONFIG_DIR/skills/agent-delegation`，否则 `${XDG_CONFIG_HOME:-~/.config}/opencode/skills/agent-delegation` |
 
 ### 每个宿主只保留一套
 
@@ -117,6 +117,30 @@ python3 scripts/install_user.py install --hosts none --targets kimi
 由于 ACP 文件限制无法约束原生文件访问，该目标明确拒绝 `approve-reads`、
 `deny-all` 和 `--no-terminal`，避免把未生效的限制当成保护。新进程采用新能力；
 已经运行的命名会话保留原进程。
+
+### OpenCode
+
+```bash
+python3 scripts/install_user.py install --hosts opencode --targets opencode
+```
+
+OpenCode 2.x 通过 `opencode acp` 直接提供 ACP，不需要额外适配器；登录、provider、
+默认模型和权限规则都沿用 OpenCode 自己的配置。注册时优先用 PATH 里的 `opencode`，
+找不到才用 `~/.opencode/bin/opencode`。Skill 装在 OpenCode 读取全局配置的目录下的
+`skills/`：依次取 `$OPENCODE_CONFIG_DIR`、`$XDG_CONFIG_HOME/opencode`、
+`~/.config/opencode`。在 OpenCode 中发起委派时传 `--caller opencode`，用 OpenCode 的 `shell` 工具
+以 `background: true` 运行一次 `wait --id <id> --event`，然后结束本轮；命令结束时
+OpenCode 会通知并恢复同一会话，由它收取一次结果。
+
+OpenCode 还会加载 `~/.claude/skills` 和 `~/.agents/skills`，同名 Skill 只保留一份，
+所以第二份副本可能遮住你刚更新的那份。安装器会拒绝任何让 OpenCode 看到两份副本的
+选择，默认选择也一样。如果 OpenCode 已经在用 portable Claude Code 或 Codex 副本，
+就不要在 `--hosts` 里选 `opencode`。
+
+OpenCode 用自己的工具执行，只把它自身权限规则判为 "ask" 的请求转给 ACP，也不使用
+ACP 的文件系统和 Terminal。因此托管目标会拒绝 `approve-reads`、`deny-all` 和
+`--no-terminal`。旧版本注册的目标没有这项元数据，需要用 `--targets opencode` 重新注册。
+实测记录见 [OpenCode runtime](plugins/agent-delegation/skills/agent-delegation/references/operations.md#opencode-runtime)。
 
 ### 已审查目标
 
@@ -317,8 +341,8 @@ stderr 中的启动消息和 `request.json` 仍保留任务 ID。
 - `cwd` 和 Prompt 用于协调任务，不提供进程隔离。
 - Runtime 记录传输结果和结构化错误。语义验收仍由调用方或独立
   verifier 负责。
-- OpenCode 已注册，但最近一次实际检查未能证明完整往返。它的原生 ACP 路径
-  发生 timeout，另一次运行返回认证错误。
+- OpenCode 作为发起方的完成通知是通过 `opencode run` 实测的，它会等待本轮
+  启动的后台任务。交互式 TUI 使用同一恢复机制，但没有单独实测。
 - Kimi Code 使用 `$KIMI_CODE_HOME/skills`，默认是 `~/.kimi-code/skills`。本安装器不会迁移
   或删除旧 Python `kimi-cli` 的 `~/.kimi`，也不安装 recovery Hook。
 

@@ -296,11 +296,13 @@ the host facility; it does not certify this wrapper or every host/version pair.
 | zCode | [Subagents](https://zcode.z.ai/cn/docs/subagents), [hooks](https://zcode.z.ai/cn/docs/hooks) | Installed 0.16.5 also exposes background Bash and completion notices. These sources and code inspection alone do not prove a live external-delegation round trip. |
 | Kimi Code | [Built-in Bash tools](https://moonshotai.github.io/kimi-code/en/reference/tools.html) | Native background Bash reports completion and owns timeout/cleanup. A CLI process that exits cannot be assumed to keep observing. |
 | Pi | [Extension message delivery](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md) | `sendMessage` with `triggerTurn` can wake a session through a loaded extension. This Skills-only package does not install that extension; use one attached wait unless the host already supplies a wake facility. |
+| OpenCode | [`shell` tool `background`](https://github.com/anomalyco/opencode/blob/464688ba686b715e28326e209b08116ad60b86e0/packages/core/src/tool/plugin/shell.ts) (source, 2.2.7) | A background command's completion notifies and resumes the session. See [OpenCode runtime](#opencode-runtime) for what was observed live. |
 
-The host-independent collection contract was checked across all 25 combinations
-of Codex, Claude, zCode, Kimi and Pi caller/target labels with deterministic worker
-fixtures, including concurrent collectors. These are shared-logic checks, not 25
-live model-service acceptance tests. Real Claude Code and Kimi Code origins
+The host-independent collection contract was checked across all 36 combinations
+of Codex, Claude, zCode, Kimi, Pi and OpenCode caller/target labels with
+deterministic worker fixtures, including concurrent collectors. These are
+shared-logic checks, not 36 live model-service acceptance tests.
+Real Claude Code and Kimi Code origins
 calling native Codex also passed background completion followed by one payload
 and one compact `already_collected` result on 2026-09-14. zCode 0.16.5 submitted
 and armed its background observer, but its single-prompt process then exited;
@@ -663,6 +665,77 @@ A subsequent real run exposed the client filesystem rejecting a user Skill outsi
 the cwd. After selecting native filesystem tools, a fresh normal-HOME session read
 the installed Hindsight Skill and copied a file successfully in 33.354s, with no
 RPC or tool errors.
+
+## OpenCode runtime
+
+Register the installed CLI with `install --hosts none --targets opencode`, or add
+`--hosts opencode` to also install the portable Skill. The Skill directory follows
+OpenCode's own global config resolution: `$OPENCODE_CONFIG_DIR/skills`, else
+`$XDG_CONFIG_HOME/opencode/skills`, else `~/.config/opencode/skills`
+([global roots](https://github.com/anomalyco/opencode/blob/464688ba686b715e28326e209b08116ad60b86e0/packages/util/src/global-roots.ts)).
+Run the installer with the same environment OpenCode uses. The managed target runs
+`opencode acp` from the `opencode` on PATH, falling back to `~/.opencode/bin/opencode`;
+the selected stable entry is recorded, and its observed version never pins execution.
+No adapter package or runtime upgrade is needed.
+Each ACP process starts its own private OpenCode server, so the background service
+and its paired browsers or apps are not involved. Login, providers, model defaults
+and permission rules stay in OpenCode. The session advertises `model`, `effort`
+(category `thought_level`) and `mode` options; `--config-option model=<id>` selects
+one of the advertised model values.
+
+OpenCode's ACP server forwards a permission request only when OpenCode's own rules
+evaluate a tool call to "ask", and it never uses the ACP filesystem or Terminal.
+Calls its rules allow run without any ACP request. The managed target therefore sets
+`native_local_tools: true`, which rejects `approve-reads`, `deny-all` and
+`--no-terminal` before dispatch. Use OpenCode's own permission configuration when a
+task needs a real restriction. Targets registered before this change lack the flag;
+register again with `--targets opencode`.
+
+OpenCode also loads `~/.claude/skills` and `~/.agents/skills` and keeps one Skill
+per id. The installer refuses any host selection that would leave OpenCode with
+both its own copy and a portable Claude Code or Codex copy.
+
+Source references, checked 2026-11-18 at OpenCode commit `464688ba` (2.2.7):
+[ACP permission bridge](https://github.com/anomalyco/opencode/blob/464688ba686b715e28326e209b08116ad60b86e0/packages/cli/src/acp/permission.ts),
+[Skill compatibility roots](https://github.com/anomalyco/opencode/blob/464688ba686b715e28326e209b08116ad60b86e0/packages/core/src/config/plugin/compatibility.ts),
+[non-interactive run lifecycle](https://github.com/anomalyco/opencode/blob/464688ba686b715e28326e209b08116ad60b86e0/packages/cli/src/run/noninteractive.ts).
+
+Observed on 2026-11-18 with macOS, OpenCode 2.3.0 and ACPX 0.21.0:
+
+- ACPX `--deny-all` did not restrict OpenCode: with zero permission requests it
+  wrote a file and ran a Shell command in the task directory.
+- Claude Code to OpenCode through the wrapper: `submit`, one native background
+  `wait --event`, then one full `wait`. The mission read a file, wrote the sum to a
+  new file and returned the expected marker in 16.683s with `end_turn`; a repeated
+  `wait` returned the compact collected event.
+- `--config-option model=<id>` switched the session model and returned `end_turn`
+  in 5.149s.
+- OpenCode to Codex, driven by `opencode run` with this Skill loaded and the
+  ordinary request "use the agent-delegation skill to delegate this to codex". With
+  a Codex mission that ran for 130.822s, OpenCode submitted with `--caller opencode`,
+  started `wait --event` through `shell` with `background: true` and ended its turn
+  at 07:13:14Z. When the observer exited, OpenCode started a new turn at 07:15:25Z
+  without user input, collected the payload once with a full `wait`, and reported
+  the expected marker.
+- With the first wording of the OpenCode rule, two of three short missions (a
+  26.906s Codex mission and an OpenCode-to-OpenCode mission) were observed through a
+  foreground `wait` instead. Both completed and collected once, but only because
+  they finished within the model's shell timeout.
+- After the rule required the background route for short missions too and named
+  the reason, four parallel OpenCode-to-OpenCode runs with the same request all
+  used background `wait --event`, ended the turn, resumed, collected once with a
+  full `wait`, and reported the correct count. These runs used the installed
+  portable Skill and OpenCode's configured default model.
+
+Release builds leave OpenCode's `shell_timeout_background` flag off
+([flag defaults](https://github.com/anomalyco/opencode/blob/464688ba686b715e28326e209b08116ad60b86e0/packages/core/src/flag.ts)),
+so a foreground command that reaches its shell timeout is stopped rather than moved
+to the background. A foreground `wait` would then lose its observer while the
+mission keeps running, which is why the Skill requires the background route.
+
+`opencode run` waits for the background jobs its prompt started and the turns they
+wake before it exits. The interactive TUI resumes through the same server-side job
+notification, but it was not observed separately here.
 
 ## Custom ACP targets
 
